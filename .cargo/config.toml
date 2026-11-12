@@ -1,0 +1,9 @@
+# ARM codegen for webOS (cortex-a9, VFP, no NEON). The Makefile repeats this
+# list in RUSTFLAGS because that env var replaces cargo config wholesale.
+[target.armv7-unknown-linux-gnueabi]
+linker = "arm-webos-linux-gnueabi-gcc"
+rustflags = [
+  "-C", "target-cpu=cortex-a9",
+  "-C", "target-feature=-neon,-soft-float",
+  "-C", "force-frame-pointers=yes",
+]

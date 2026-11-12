@@ -1,0 +1,15 @@
+[package]
+name = "harbor-screens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harbor-ui-kit.workspace = true
+harbor-ui.workspace = true
+harbor-media.workspace = true
+harbor-session.workspace = true
+harbor-sources.workspace = true
+harbor-gfx.workspace = true
+harbor-platform.workspace = true
+harbor-base.workspace = true

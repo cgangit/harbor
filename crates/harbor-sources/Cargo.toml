@@ -1,0 +1,9 @@
+[package]
+name = "harbor-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harbor-base.workspace = true
+harbor-platform.workspace = true

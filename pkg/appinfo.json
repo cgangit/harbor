@@ -1,0 +1,14 @@
+{
+  "id": "com.harbor.player",
+  "version": "0.1.0",
+  "vendor": "Harbor",
+  "type": "native",
+  "main": "harbor",
+  "title": "Harbor",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "splashBackground": "splash.png",
+  "resolution": "1920x1080",
+  "appDescription": "Native media player for LG webOS",
+  "disableBackHistoryAPI": true
+}

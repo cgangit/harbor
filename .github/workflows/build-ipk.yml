@@ -1,0 +1,44 @@
+name: build ARM IPK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/**"
+      - "src/**"
+      - "pkg/**"
+      - "ci/**"
+      - "Makefile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/build-ipk.yml"
+
+jobs:
+  ipk:
+    name: ARM IPK
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install webosbrew NDK
+        id: ndk
+        run: |
+          set -euo pipefail
+          make setup-env
+          echo "sdk-dir=$HOME/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot" >> "$GITHUB_OUTPUT"
+
+      - name: Build + package
+        env:
+          WEBOS_NDK: ${{ steps.ndk.outputs.sdk-dir }}
+        run: |
+          set -euo pipefail
+          make ipk
+          test -s pkg/com.harbor.player_*_arm.ipk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harbor-ipk
+          path: pkg/*.ipk
+          if-no-files-found: error

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/harbor-base",
+    "crates/harbor-platform",
+    "crates/harbor-gfx",
+    "crates/harbor-ui",
+    "crates/harbor-sources",
+    "crates/harbor-session",
+    "crates/harbor-media",
+    "crates/harbor-ui-kit",
+    "crates/harbor-screens",
+    "crates/harbor-app",
+    "crates/harbor-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Harbor contributors"]
+rust-version = "1.74"
+
+[workspace.dependencies]
+harbor-base = { path = "crates/harbor-base" }
+harbor-platform = { path = "crates/harbor-platform" }
+harbor-gfx = { path = "crates/harbor-gfx" }
+harbor-ui = { path = "crates/harbor-ui" }
+harbor-sources = { path = "crates/harbor-sources" }
+harbor-session = { path = "crates/harbor-session" }
+harbor-media = { path = "crates/harbor-media" }
+harbor-ui-kit = { path = "crates/harbor-ui-kit" }
+harbor-screens = { path = "crates/harbor-screens" }
+harbor-app = { path = "crates/harbor-app" }
+sdl2 = { version = "0.37", default-features = false, features = ["unsafe_textures"] }

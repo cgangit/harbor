@@ -1,0 +1,16 @@
+/target/
+/target-webos/
+/ipkroot/
+src/*.o
+__pycache__/
+*.pyc
+/rust-modules/target/
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+*.ipk
+pkg/harbor
+src/config.local.h
+.tv-host
+.tv-mac
+/tmp/

@@ -1,0 +1,10 @@
+[package]
+name = "harbor-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harbor-base.workspace = true
+harbor-platform.workspace = true
+harbor-sources.workspace = true

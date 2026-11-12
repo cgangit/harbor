@@ -1,0 +1,11 @@
+[package]
+name = "harbor-ui-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harbor-media.workspace = true
+harbor-platform.workspace = true
+harbor-session.workspace = true
+harbor-ui.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "harbor-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "harbor-sim"
+path = "src/main.rs"
+
+[dependencies]
+harbor-app = { path = "../harbor-app" }

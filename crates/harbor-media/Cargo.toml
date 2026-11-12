@@ -1,0 +1,12 @@
+[package]
+name = "harbor-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harbor-base.workspace = true
+harbor-gfx.workspace = true
+harbor-platform.workspace = true
+harbor-session.workspace = true
+harbor-sources.workspace = true
