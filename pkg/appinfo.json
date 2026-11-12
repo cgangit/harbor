@@ -7,6 +7,8 @@
   "title": "Harbor",
   "icon": "icon.png",
   "largeIcon": "largeIcon.png",
+  "iconColor": "#615fd1",
+  "bgColor": "#000000",
   "splashBackground": "splash.png",
   "resolution": "1920x1080",
   "appDescription": "Native media player for LG webOS",
