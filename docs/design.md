@@ -3,6 +3,11 @@
 Feature Name: webos-native-player
 Updated: 2026-11-05
 
+> Requirements for this feature now live in OpenSpec at `openspec/specs/`
+> (capabilities: `app-shell`, `browsing`, `sources`, `playback`, `resume`,
+> `settings`, `errors`). This document remains the architecture / data model /
+> test strategy reference.
+
 ## Description
 
 Harbor is a native LG webOS media player. It installs as an IPK (`com.harbor.player`, working name), draws a 1920x1080 / 60 fps GPU UI with SDL2 + OpenGL ES, and plays video on the television's hardware decoder. v1 sources: local USB/internal files, DLNA/UPnP MediaServers, SMB/CIFS shares. No WebView, no transcoding, no Plex.
