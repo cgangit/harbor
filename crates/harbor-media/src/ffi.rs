@@ -6,9 +6,11 @@ pub const FEED_SYMS: &[&str] = &[
 
 #[cfg(all(target_arch = "arm", target_os = "linux"))]
 mod native {
+    use std::os::raw::c_char;
+
     extern "C" {
         pub fn sf_create() -> i32;
-        pub fn sf_load(payload: *const i8) -> i32;
+        pub fn sf_load(payload: *const c_char) -> i32;
         pub fn sf_play() -> i32;
         pub fn sf_pause() -> i32;
         pub fn sf_feed(bytes: *const u8, len: i32, pts_ns: i64, es: i32) -> i32;
@@ -16,7 +18,7 @@ mod native {
         pub fn sf_unload() -> i32;
         pub fn sf_destroy();
         pub fn acb_create() -> i32;
-        pub fn acb_bind(media_id: *const i8) -> i32;
+        pub fn acb_bind(media_id: *const c_char) -> i32;
         pub fn acb_send_video_data(info: *const u8, len: i32) -> i32;
         pub fn acb_start(x: i32, y: i32, w: i32, h: i32) -> i32;
         pub fn acb_unload() -> i32;
@@ -28,10 +30,12 @@ pub use native::*;
 
 #[cfg(not(all(target_arch = "arm", target_os = "linux")))]
 mod stub {
+    use std::os::raw::c_char;
+
     pub unsafe fn sf_create() -> i32 {
         -1
     }
-    pub unsafe fn sf_load(_payload: *const i8) -> i32 {
+    pub unsafe fn sf_load(_payload: *const c_char) -> i32 {
         -1
     }
     pub unsafe fn sf_play() -> i32 {
@@ -53,7 +57,7 @@ mod stub {
     pub unsafe fn acb_create() -> i32 {
         -1
     }
-    pub unsafe fn acb_bind(_media_id: *const i8) -> i32 {
+    pub unsafe fn acb_bind(_media_id: *const c_char) -> i32 {
         -1
     }
     pub unsafe fn acb_send_video_data(_info: *const u8, _len: i32) -> i32 {
@@ -71,10 +75,10 @@ mod stub {
 pub use stub::*;
 
 #[no_mangle]
-pub extern "C" fn sf_on_event(_type: i32, _json: *const i8) {}
+pub extern "C" fn sf_on_event(_type: i32, _json: *const std::os::raw::c_char) {}
 
 #[no_mangle]
-pub extern "C" fn acb_on_event(_type: i32, _json: *const i8) {}
+pub extern "C" fn acb_on_event(_type: i32, _json: *const std::os::raw::c_char) {}
 
 #[cfg(test)]
 mod tests {
