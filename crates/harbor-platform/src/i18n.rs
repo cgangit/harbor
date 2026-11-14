@@ -91,6 +91,7 @@ pub fn t<'a>(lang: Lang, key: &'a str) -> &'a str {
             "电视与服务器需在同一局域网",
         ),
         "retry" => pick(lang, "Retry", "重试"),
+        "loading" => pick(lang, "Loading...", "加载中..."),
         "smb_share" => pick(lang, "SMB share", "SMB 共享"),
         "host" => pick(lang, "Host", "主机"),
         "share" => pick(lang, "Share", "共享名"),

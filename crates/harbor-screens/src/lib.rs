@@ -14,6 +14,7 @@ use harbor_ui::Focus;
 use harbor_ui_kit::{AddSource, HudState};
 
 pub use catalog::{build_catalog, refresh_catalog, Catalog};
+pub use browser::{drain as drain_browse, BrowseInfo, BrowseQueue, SourceHandle};
 pub use discovery::poll_discovery;
 pub use nav::{handle, persist, tick_add, View};
 
@@ -25,10 +26,10 @@ pub enum Screen {
     Player,
 }
 
-pub fn rows(screen: Screen, catalog: &Catalog) -> Vec<usize> {
+pub fn rows(screen: Screen, catalog: &Catalog, browse: BrowseInfo) -> Vec<usize> {
     match screen {
         Screen::Home => home::rows(catalog),
-        Screen::Browser => browser::rows(catalog),
+        Screen::Browser => browser::rows(catalog, browse),
         Screen::Settings => settings::rows(catalog),
         Screen::Player => vec![1],
     }
@@ -41,8 +42,9 @@ pub fn draw(
     focus: Focus,
     hud: Option<&HudState>,
     add: Option<&AddSource>,
+    browse: Option<BrowseInfo>,
 ) {
-    draw_lang(s, screen, catalog, focus, hud, add, Lang::En);
+    draw_lang(s, screen, catalog, focus, hud, add, browse, Lang::En);
 }
 
 pub fn draw_lang(
@@ -52,6 +54,7 @@ pub fn draw_lang(
     focus: Focus,
     hud: Option<&HudState>,
     add: Option<&AddSource>,
+    browse: Option<BrowseInfo>,
     lang: Lang,
 ) {
     if screen != Screen::Player {
@@ -59,7 +62,7 @@ pub fn draw_lang(
     }
     match screen {
         Screen::Home => home::draw_lang(s, catalog, focus, lang),
-        Screen::Browser => browser::draw_lang(s, catalog, focus, lang),
+        Screen::Browser => browser::draw_lang(s, catalog, focus, browse.unwrap_or_default(), lang),
         Screen::Settings => settings::draw_lang(s, catalog, focus, lang),
         Screen::Player => player::draw_lang(s, hud.unwrap_or(&HudState::playing("Player")), lang),
     }
@@ -95,7 +98,7 @@ mod tests {
             (Screen::Settings, "Settings"),
         ] {
             let mut r = Recorder::default();
-            draw(&mut r, screen, &cat, Focus::default(), None, None);
+            draw(&mut r, screen, &cat, Focus::default(), None, None, None);
             let texts: Vec<_> = r
                 .ops
                 .iter()
@@ -122,6 +125,7 @@ mod tests {
             Focus { row: 2, col: 0 },
             None,
             None,
+            None,
             Lang::ZhHans,
         );
         let texts: Vec<_> = r
@@ -144,7 +148,7 @@ mod tests {
         let screens = [Screen::Home, Screen::Browser, Screen::Settings];
         for screen in screens {
             let mut r = Recorder::default();
-            draw(&mut r, screen, &cat, Focus::default(), None, None);
+            draw(&mut r, screen, &cat, Focus::default(), None, None, None);
             for px in r.text_sizes() {
                 assert!(
                     px >= harbor_ui::size::CAPTION,
@@ -162,7 +166,7 @@ mod tests {
             } else {
                 cat.clone()
             };
-            draw(&mut r, screen, &cat_ref, Focus::default(), hud.as_ref(), None);
+            draw(&mut r, screen, &cat_ref, Focus::default(), hud.as_ref(), None, None);
             for px in r.text_sizes() {
                 assert!(px >= harbor_ui::size::CAPTION);
             }

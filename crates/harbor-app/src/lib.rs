@@ -36,6 +36,9 @@ pub fn run() -> Result<(), String> {
             harbor_screens::refresh_catalog(&mut view);
             log_catalog(&view, "refresh");
         }
+        // Fold any posted listing result into the view (design D3): one
+        // drain per frame, never a blocking read on the present loop.
+        harbor_screens::drain_browse(&mut view);
         if view.screen == Screen::Player {
             if let Some(hud) = view.hud.as_mut() {
                 harbor_ui_kit::tick(hud);
@@ -61,6 +64,7 @@ pub fn run() -> Result<(), String> {
             view.focus,
             view.hud.as_ref(),
             view.add.as_ref(),
+            Some(harbor_screens::BrowseInfo::of(&view)),
             view.settings.ui_lang,
         );
         frame.present();

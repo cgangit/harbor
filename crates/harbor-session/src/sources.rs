@@ -37,6 +37,18 @@ impl SourceConfig {
         }
     }
 
+    /// The MediaServer this config was saved from, for the browse path.
+    /// `location` only matters during discovery (which re-fetches the
+    /// description), so it is not persisted and comes back empty here.
+    pub fn dlna_server(&self) -> Option<MediaServer> {
+        Some(MediaServer {
+            udn: self.dlna_udn.clone()?,
+            friendly_name: self.name.clone(),
+            location: String::new(),
+            control_url: self.dlna_control_url.clone()?,
+        })
+    }
+
     pub fn smb(id: &str, host: &str, share: &str, username: &str, domain: &str) -> Self {
         let name = if username.is_empty() {
             format!("{host}/{share}")

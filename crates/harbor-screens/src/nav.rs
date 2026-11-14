@@ -2,6 +2,7 @@ use harbor_platform::Key;
 use harbor_session::{
     should_offer, CredentialVault, Resume, ResumeStore, Settings, SourceConfig, SourceStore,
 };
+use harbor_sources::EntryKind;
 use harbor_ui::{reduce, Focus};
 use harbor_ui_kit::{AddAction, AddSource, HudState};
 
@@ -30,6 +31,23 @@ pub struct View {
     pub catalog: Catalog,
     /// Set whenever the inputs above change; the app loop refreshes on it.
     pub needs_refresh: bool,
+    /// Source ids with a first-page listing in flight (D4): the Browser
+    /// draws a loading row while any remain, and `rows()` counts it.
+    pub loading: Vec<String>,
+    /// Failure class of the last listing (D4); the Browser draws the error
+    /// row until the next start or a successful drain. Cleared by
+    /// `refresh_catalog`, which rebuilds the local view.
+    pub browse_error: Option<String>,
+    /// The queue listing workers post into (D3); created by
+    /// `browser::start`, drained once per frame by the app loop.
+    pub browse: Option<crate::browser::BrowseQueue>,
+    /// The source whose page is on screen — OK on a folder lists its
+    /// children through the same handle (design: follow-up `list(path)`).
+    pub browsing: Option<crate::browser::SourceHandle>,
+    /// The last drained page: `catalog.files` keeps only names, but OK on
+    /// the Browser needs each entry's kind and id to tell folders from
+    /// videos. Cleared by `refresh_catalog` alongside `browse_error`.
+    pub page: Option<harbor_sources::Page>,
     stack: Vec<(Screen, Focus)>,
 }
 
@@ -48,6 +66,11 @@ impl Default for View {
             settings: Settings::default(),
             catalog: Catalog::empty(),
             needs_refresh: false,
+            loading: Vec::new(),
+            browse_error: None,
+            browse: None,
+            browsing: None,
+            page: None,
             stack: Vec::new(),
         }
     }
@@ -98,7 +121,11 @@ fn dispatch(view: &View, key: Key) -> View {
     match key {
         Key::Left | Key::Right | Key::Up | Key::Down => {
             let mut next = view.clone();
-            next.focus = reduce(view.focus, &rows(view.screen, &view.catalog), key);
+            next.focus = reduce(
+                view.focus,
+                &rows(view.screen, &view.catalog, crate::browser::BrowseInfo::of(view)),
+                key,
+            );
             next.hud = None;
             next
         }
@@ -233,15 +260,42 @@ fn on_ok(view: &View) -> View {
     let catalog = &view.catalog;
     match view.screen {
         Screen::Home => {
-            let screen = if catalog.is_empty() || view.focus.row == 3 {
-                Screen::Settings
-            } else {
-                Screen::Browser
-            };
-            push(view, screen)
+            if catalog.is_empty() {
+                return push(view, Screen::Settings);
+            }
+            if view.focus.row == 3 {
+                // Sources shelf: a configured network source opens its
+                // browser with the first page listing (browsing spec: the
+                // user opens a Source, the System lists it); anything else
+                // keeps the Settings shortcut this row had.
+                let name = catalog.sources.get(view.focus.col).map(String::as_str);
+                if let Some(source) = name.and_then(|n| crate::browser::network_source(view, n)) {
+                    let mut next = push(view, Screen::Browser);
+                    crate::browser::start(&mut next, source, "");
+                    return next;
+                }
+                return push(view, Screen::Settings);
+            }
+            push(view, Screen::Browser)
         }
         Screen::Browser => {
             if view.focus.row == 2 {
+                // Folder entries list their children through the same
+                // source handle; videos (or no listing on screen) open the
+                // player exactly as before.
+                let entry = view
+                    .page
+                    .as_ref()
+                    .and_then(|page| page.entries.get(view.focus.col));
+                if let Some(entry) = entry {
+                    if entry.kind == EntryKind::Dir {
+                        if let Some(source) = view.browsing.clone() {
+                            let mut next = view.clone();
+                            crate::browser::start(&mut next, source, &entry.id);
+                            return next;
+                        }
+                    }
+                }
                 let title = catalog
                     .files
                     .get(view.focus.col)
@@ -263,6 +317,17 @@ fn on_ok(view: &View) -> View {
                 let mut next = view.clone();
                 next.add = Some(AddSource::pick());
                 next
+            } else if view.focus.row == 0 {
+                // Source row: a configured network source opens its browser
+                // with the first page listing on a worker (4.3); rows that
+                // are not configured network sources keep no action.
+                let name = catalog.sources.get(view.focus.col).map(String::as_str);
+                if let Some(source) = name.and_then(|n| crate::browser::network_source(view, n)) {
+                    let mut next = push(view, Screen::Browser);
+                    crate::browser::start(&mut next, source, "");
+                    return next;
+                }
+                view.clone()
             } else {
                 view.clone()
             }
@@ -639,6 +704,7 @@ pub fn persist(view: &mut View) {
             Focus::default(),
             None,
             None,
+            None,
         );
         let texts: Vec<&str> = rec
             .ops
@@ -657,5 +723,62 @@ pub fn persist(view: &mut View) {
         v = handle(&v, Key::Back); // Settings -> Home
         assert_eq!(v.screen, Screen::Home);
         assert!(v.needs_refresh, "entering Home must re-read the sources");
+    }
+
+    /// Task 4.3: selecting a configured SMB source (Settings source row and
+    /// the Home sources shelf) starts its listing, and the drained page
+    /// reaches `catalog.files`.
+    #[test]
+    fn selecting_smb_source_sets_loading_and_drain_fills_catalog() {
+        use harbor_sources::{Entry, Page};
+
+        let smb = || SourceConfig::smb("smb:nas/media", "nas", "media", "alice", "HOME");
+
+        // Settings source row.
+        let mut v = View::default();
+        v.sources.put(smb());
+        v.catalog = crate::build_catalog(&v.sources, &[], &[]);
+        v.screen = Screen::Settings;
+        v.focus.row = 0;
+        v.focus.col = 0;
+
+        let mut v = handle(&v, Key::Ok);
+        assert_eq!(v.screen, Screen::Browser);
+        assert_eq!(v.loading, vec!["smb:nas/media"]);
+        assert!(v.browse.is_some());
+        assert!(v.browsing.is_some());
+
+        // The real worker dials an absent host and would post later; swap in
+        // the queue this page lands in so the drain is deterministic.
+        let queue = crate::browser::BrowseQueue::new();
+        v.browse = Some(queue.clone());
+        queue.push(crate::browser::BrowseResult {
+            source_id: "smb:nas/media".into(),
+            outcome: Ok(Page {
+                entries: vec![Entry {
+                    id: "movie.mkv".into(),
+                    parent: String::new(),
+                    name: "movie.mkv".into(),
+                    kind: EntryKind::Video,
+                    size: Some(4),
+                    mtime: None,
+                    url: None,
+                }],
+            }),
+        });
+        crate::browser::drain(&mut v);
+        assert!(v.loading.is_empty());
+        assert!(v.browse_error.is_none());
+        assert_eq!(v.catalog.files, vec!["movie.mkv"]);
+
+        // Home sources shelf: the same selection starts the same listing.
+        let mut h = View::default();
+        h.sources.put(smb());
+        h.catalog = crate::build_catalog(&h.sources, &[], &[]);
+        h.focus.row = 3;
+        h.focus.col = 0;
+        let h = handle(&h, Key::Ok);
+        assert_eq!(h.screen, Screen::Browser);
+        assert_eq!(h.loading, vec!["smb:nas/media"]);
     }
 }

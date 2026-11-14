@@ -62,6 +62,11 @@ pub fn refresh_catalog(view: &mut View) {
     let mounts = harbor_sources::discover();
     view.catalog = build_catalog(&view.sources, &view.store.iter(), &mounts);
     view.needs_refresh = false;
+    // The rebuilt catalog describes the local view again: a drained network
+    // page or a stale failure class must not outlive it (the next listing
+    // re-sets both through `browser::start` / `browser::drain`).
+    view.browse_error = None;
+    view.page = None;
 }
 
 /// Pure catalog construction — separated from `refresh_catalog` so tests can
