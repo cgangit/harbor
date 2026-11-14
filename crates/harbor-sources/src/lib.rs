@@ -2,6 +2,7 @@ pub mod dlna;
 pub mod entry;
 pub mod error;
 pub mod handle;
+pub mod http;
 pub mod local;
 pub mod smb;
 
@@ -9,9 +10,10 @@ use crate::error::SourceError;
 use crate::handle::MediaHandle;
 
 pub use dlna::{
-    browse_soap, msearch_packet, parse_browse_response, parse_device_description, parse_didl,
-    parse_ssdp, parse_ssdp_many, DlnaSource, MediaServer, SsdpDevice, CONTENT_DIRECTORY_ST,
-    DISCOVER_TIMEOUT_MS, MEDIA_SERVER_ST, OBJECT_ID_ROOT,
+    browse_page, browse_soap, describe, discover_media_servers, msearch_packet,
+    parse_browse_response, parse_device_description, parse_didl, parse_ssdp, parse_ssdp_many,
+    DlnaSource, MediaServer, SsdpDevice, CONTENT_DIRECTORY_ST, DISCOVER_TIMEOUT_MS,
+    MEDIA_SERVER_ST, OBJECT_ID_ROOT, SSDP_MULTICAST,
 };
 pub use entry::{is_video_name, Entry, EntryKind, Page, Probe, VIDEO_EXTS};
 pub use error::SourceError as Error;

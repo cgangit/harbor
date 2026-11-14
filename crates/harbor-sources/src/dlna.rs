@@ -1,12 +1,31 @@
+use std::net::{ToSocketAddrs, UdpSocket};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use crate::entry::{ext_of, is_video_name, Entry, EntryKind, Page, Probe};
 use crate::error::SourceError;
 use crate::handle::MediaHandle;
+use crate::http;
 use crate::{Kind, Source, SourceId};
 
 pub const MEDIA_SERVER_ST: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 pub const CONTENT_DIRECTORY_ST: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
 pub const DISCOVER_TIMEOUT_MS: u64 = 8_000;
 pub const OBJECT_ID_ROOT: &str = "0";
+/// SSDP multicast group (`msearch_packet` addresses it).
+pub const SSDP_MULTICAST: &str = "239.255.255.250:1900";
+/// Stop collecting this long after the most recent reply. LAN servers answer
+/// a M-SEARCH within milliseconds; the full budget is reserved for the
+/// empty-network case the spec pins at `DISCOVER_TIMEOUT_MS`.
+pub const SSDP_QUIET_MS: u64 = 1_000;
+/// Per-device budget for fetching the device description over HTTP.
+pub const DESCRIBE_BUDGET: Duration = Duration::from_secs(2);
+/// Budget for a single ContentDirectory Browse: the DLNA-side 8 s family
+/// (design D1), enforced as connect/read/write timeouts by `http::request`.
+pub const BROWSE_TIMEOUT: Duration = Duration::from_secs(8);
+/// First-page cap so one Browse can never stream an unbounded `Result` at
+/// the UI (design D3 risk: large listings freezing the Browser draw).
+pub const BROWSE_PAGE_CAP: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SsdpDevice {
@@ -24,11 +43,26 @@ pub struct MediaServer {
     pub control_url: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DlnaSource {
     pub id: SourceId,
     pub server: MediaServer,
-    pub pages: Vec<(String, Page)>,
+    /// `object-id` → page cache. Filled by fixtures (`with_page`) and by the
+    /// network path in `list`. A mutex (not a plain `Vec`) because
+    /// `Source::list` takes `&self` and a browse worker fills it from
+    /// another thread (design D3).
+    pages: Mutex<Vec<(String, Page)>>,
+}
+
+impl Clone for DlnaSource {
+    fn clone(&self) -> Self {
+        let pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        Self {
+            id: self.id.clone(),
+            server: self.server.clone(),
+            pages: Mutex::new(pages.clone()),
+        }
+    }
 }
 
 impl DlnaSource {
@@ -36,28 +70,43 @@ impl DlnaSource {
         Self {
             id: SourceId(format!("dlna:{}", server.udn)),
             server,
-            pages: Vec::new(),
+            pages: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn with_page(mut self, object_id: &str, page: Page) -> Self {
-        self.pages.push((object_id.to_string(), page));
+    pub fn with_page(self, object_id: &str, page: Page) -> Self {
+        self.pages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((object_id.to_string(), page));
         self
     }
 
-    fn page_for(&self, path: &str) -> Result<&Page, SourceError> {
-        let id = if path.is_empty() || path == "/" {
-            OBJECT_ID_ROOT
+    fn object_id(path: &str) -> String {
+        if path.is_empty() || path == "/" {
+            OBJECT_ID_ROOT.to_string()
         } else {
-            path.trim_start_matches('/')
-        };
+            path.trim_start_matches('/').to_string()
+        }
+    }
+
+    /// A cached page, if this object was listed before (offline path).
+    fn cached(&self, id: &str) -> Option<Page> {
         self.pages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|(k, _)| k == id)
-            .map(|(_, p)| p)
-            .ok_or_else(|| SourceError::NotFound {
-                path: id.to_string(),
-            })
+            .map(|(_, p)| p.clone())
+    }
+
+    fn cache(&self, id: &str, page: Page) {
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = pages.iter_mut().find(|(k, _)| k == id) {
+            slot.1 = page;
+        } else {
+            pages.push((id.to_string(), page));
+        }
     }
 }
 
@@ -74,8 +123,25 @@ impl Source for DlnaSource {
         &self.server.friendly_name
     }
 
+    /// First the page cache (a fixture or an earlier browse is served
+    /// offline); on a miss, browse the ContentDirectory over HTTP and fill
+    /// the cache (task 2.2). A UPnP "No such object" fault reads as
+    /// `NotFound`, matching the local source; other faults keep their code.
     fn list(&self, path: &str) -> Result<Page, SourceError> {
-        Ok(self.page_for(path)?.clone())
+        let id = Self::object_id(path);
+        if let Some(page) = self.cached(&id) {
+            return Ok(page);
+        }
+        match browse_page(&self.server.control_url, &id, BROWSE_TIMEOUT) {
+            Ok(page) => {
+                self.cache(&id, page.clone());
+                Ok(page)
+            }
+            Err(SourceError::Upnp { code: 701, .. }) => Err(SourceError::NotFound {
+                path: id,
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     fn open(&self, entry: &Entry) -> Result<MediaHandle, SourceError> {
@@ -228,7 +294,124 @@ pub fn join_url(base: &str, rel: &str) -> String {
     format!("{trimmed}/{}", rel.trim_start_matches('/'))
 }
 
+/// Discover MediaServers via SSDP (design D5): send a M-SEARCH to `target`,
+/// re-send once while nothing answers, and collect replies until `budget`
+/// expires or replies have been quiet for `SSDP_QUIET_MS`. Each responder's
+/// device description is then fetched over HTTP for its friendly name and
+/// ContentDirectory control URL; responders that cannot be described are
+/// skipped (a MediaServer without a control URL cannot be browsed).
+pub fn discover_media_servers(
+    target: &str,
+    budget: Duration,
+) -> Result<Vec<MediaServer>, SourceError> {
+    let addr = target
+        .to_socket_addrs()
+        .map_err(|e| SourceError::Io(format!("ssdp target {target}: {e}")))?
+        .next()
+        .ok_or_else(|| SourceError::Io(format!("ssdp target {target}: no address")))?;
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| SourceError::Io(format!("ssdp bind: {e}")))?;
+    let msearch = msearch_packet();
+    socket
+        .send_to(msearch.as_bytes(), addr)
+        .map_err(|e| SourceError::Io(format!("ssdp send: {e}")))?;
+    let mut sends = 1;
+    let mut last_send = Instant::now();
+    let quiet = Duration::from_millis(SSDP_QUIET_MS);
+    let deadline = Instant::now() + budget;
+    let mut packets: Vec<String> = Vec::new();
+    let mut last_reply: Option<Instant> = None;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if let Some(t) = last_reply {
+            if now.duration_since(t) >= quiet {
+                break;
+            }
+        }
+        // One re-send while the network stays silent: a single M-SEARCH can
+        // be dropped, and the empty-network case still ends at `budget`.
+        if sends < 2 && last_reply.is_none() && now.duration_since(last_send) >= Duration::from_millis(250) {
+            let _ = socket.send_to(msearch.as_bytes(), addr);
+            sends += 1;
+            last_send = now;
+        }
+        let slice = deadline.saturating_duration_since(now).min(Duration::from_millis(100));
+        socket
+            .set_read_timeout(Some(slice))
+            .map_err(|e| SourceError::Io(format!("ssdp timeout: {e}")))?;
+        let mut buf = [0u8; 4096];
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                packets.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                last_reply = Some(Instant::now());
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(SourceError::Io(e.to_string())),
+        }
+    }
+    let refs: Vec<&str> = packets.iter().map(String::as_str).collect();
+    let mut servers = Vec::new();
+    for device in parse_ssdp_many(&refs) {
+        match describe(&device.location, DESCRIBE_BUDGET) {
+            Some(server) => servers.push(server),
+            None => harbor_base::log(&format!(
+                "discovery: no description from {}",
+                device.location
+            )),
+        }
+    }
+    harbor_base::log(&format!("discovery: {} server(s)", servers.len()));
+    Ok(servers)
+}
+
+/// Fetch a device description over HTTP and parse its identity (design D1).
+/// Returns `None` for transport errors, non-200 responses, and documents
+/// without a ContentDirectory control URL — none of those can be browsed.
+pub fn describe(location: &str, budget: Duration) -> Option<MediaServer> {
+    let resp = http::get(location, budget).ok()?;
+    if resp.status != 200 {
+        return None;
+    }
+    let xml = resp.body_text().ok()?;
+    parse_device_description(xml, location)
+}
+
+/// POST a ContentDirectory `Browse` for `object_id` through the HTTP helper
+/// and parse the DIDL page (design D1). Only the first page is requested —
+/// `RequestedCount` capped at [`BROWSE_PAGE_CAP`] so one Browse cannot
+/// stream an unbounded result. UPnP faults arrive as HTTP 500 with a
+/// `s:Fault` body; `parse_browse_response` turns those into
+/// `SourceError::Upnp`.
+pub fn browse_page(
+    control_url: &str,
+    object_id: &str,
+    budget: Duration,
+) -> Result<Page, SourceError> {
+    let envelope = browse_soap_paged(object_id, 0, BROWSE_PAGE_CAP);
+    let resp = http::post_soap(
+        control_url,
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &envelope,
+        budget,
+    )?;
+    let body = resp.body_text()?.to_string();
+    parse_browse_response(&body)
+}
+
 pub fn browse_soap(object_id: &str) -> String {
+    browse_soap_paged(object_id, 0, 0)
+}
+
+/// Paged variant: `count = 0` asks the server for everything, while the
+/// listing path always caps at [`BROWSE_PAGE_CAP`].
+pub fn browse_soap_paged(object_id: &str, start: usize, count: usize) -> String {
     format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
@@ -239,14 +422,16 @@ pub fn browse_soap(object_id: &str) -> String {
             "<ObjectID>{}</ObjectID>",
             "<BrowseFlag>BrowseDirectChildren</BrowseFlag>",
             "<Filter>*</Filter>",
-            "<StartingIndex>0</StartingIndex>",
-            "<RequestedCount>0</RequestedCount>",
+            "<StartingIndex>{}</StartingIndex>",
+            "<RequestedCount>{}</RequestedCount>",
             "<SortCriteria></SortCriteria>",
             "</u:Browse>",
             "</s:Body>",
             "</s:Envelope>"
         ),
-        xml_escape(object_id)
+        xml_escape(object_id),
+        start,
+        count
     )
 }
 
@@ -578,6 +763,42 @@ pub const SAMPLE_BROWSE_FAULT: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    /// Read one HTTP request (headers + Content-Length body) before the
+    /// fixture replies — replying mid-body resets the client's write.
+    fn read_full_request(s: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let Ok(n) = s.read(&mut tmp) else { break };
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() > 1 << 20 {
+                break;
+            }
+            let Some(sep) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..sep]).into_owned();
+            let content_len = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if buf.len() >= sep + 4 + content_len {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
 
     #[test]
     fn msearch_targets_mediaserver() {
@@ -585,6 +806,84 @@ mod tests {
         assert!(p.starts_with("M-SEARCH * HTTP/1.1"));
         assert!(p.contains(MEDIA_SERVER_ST));
         assert!(p.contains("ssdp:discover"));
+    }
+
+    /// End-to-end discovery against local fixtures: a UDP responder answers
+    /// the M-SEARCH with two known devices, and a TCP server serves their
+    /// device descriptions. Budget is short because the loop also honours
+    /// the quiet window (the fixture replies immediately).
+    #[test]
+    fn discover_media_servers_returns_two_known_devices() {
+        use std::io::Write;
+        use std::net::{TcpListener, UdpSocket};
+        use std::thread;
+
+        let device_xml = |friendly: &str, udn: &str| {
+            SAMPLE_DEVICE_XML
+                .replace("Living Room NAS", friendly)
+                .replace("uuid:minidlna-living", udn)
+        };
+
+        // HTTP fixture: route each path to one known device description.
+        let http = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_port = http.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for conn in http.incoming().flatten() {
+                let mut conn = conn;
+                let mut buf = [0u8; 2048];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (friendly, udn) = if req.starts_with("GET /dev1.xml") {
+                    ("Living Room NAS", "uuid:minidlna-living")
+                } else {
+                    ("Office NAS", "uuid:office-nas")
+                };
+                let body = device_xml(friendly, udn);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = conn.write_all(resp.as_bytes());
+            }
+        });
+
+        // UDP fixture: answer the M-SEARCH with both devices' locations.
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_port = udp.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            if let Ok((_, from)) = udp.recv_from(&mut buf) {
+                for path in ["/dev1.xml", "/dev2.xml"] {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         LOCATION: http://127.0.0.1:{http_port}{path}\r\n\
+                         ST: {MEDIA_SERVER_ST}\r\n\
+                         USN: uuid:{path}::{MEDIA_SERVER_ST}\r\n\r\n"
+                    );
+                    let _ = udp.send_to(reply.as_bytes(), from);
+                }
+            }
+        });
+
+        let servers =
+            discover_media_servers(&format!("127.0.0.1:{udp_port}"), Duration::from_millis(400))
+                .unwrap();
+        let mut names: Vec<&str> = servers
+            .iter()
+            .map(|s| s.friendly_name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Living Room NAS", "Office NAS"], "{servers:?}");
+        let office = servers
+            .iter()
+            .find(|s| s.friendly_name == "Office NAS")
+            .unwrap();
+        assert_eq!(office.udn, "uuid:office-nas");
+        assert_eq!(
+            office.control_url,
+            format!("http://127.0.0.1:{http_port}/ctl/ContentDir")
+        );
     }
 
     #[test]
@@ -647,23 +946,116 @@ mod tests {
     #[test]
     fn source_lists_fixture_page() {
         let page = parse_browse_response(SAMPLE_BROWSE_SOAP).unwrap();
-        let server = parse_device_description(
+        let mut server = parse_device_description(
             SAMPLE_DEVICE_XML,
             "http://192.168.1.10:8200/rootDesc.xml",
         )
         .unwrap();
+        // A dead control URL proves the cached page is served without any
+        // network I/O (task 2.2: cached fixture page offline).
+        server.control_url = "http://127.0.0.1:1/ctl/ContentDir".into();
         let src = DlnaSource::from_server(server).with_page(OBJECT_ID_ROOT, page);
         assert_eq!(src.kind(), Kind::Dlna);
         assert_eq!(src.display_name(), "Living Room NAS");
         let listed = src.list("").unwrap();
         assert_eq!(listed.entries.len(), 2);
-        let missing = src.list("99").unwrap_err();
-        match missing {
-            SourceError::NotFound { path } => assert_eq!(path, "99"),
-            other => panic!("{other:?}"),
-        }
         let video = listed.entries.iter().find(|e| e.kind == EntryKind::Video).unwrap();
         assert!(video.url.as_deref().unwrap().starts_with("http://"));
+        // A cache miss takes the network path — and the dead URL fails.
+        let err = src.list("missing").unwrap_err();
+        assert!(matches!(err, SourceError::Io(_)), "{err:?}");
+    }
+
+    /// The network path (task 2.2): an uncached `list` POSTs Browse to the
+    /// local server and fills the page cache, so the next call is offline
+    /// even after the server is gone.
+    #[test]
+    fn network_path_fills_cache_from_local_server() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        let request = Arc::new(std::sync::Mutex::new(String::new()));
+        let request_clone = request.clone();
+        thread::spawn(move || {
+            // One connection only: a second Browse attempt would be refused.
+            if let Ok((mut s, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                *request_clone.lock().unwrap() = read_full_request(&mut s);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    SAMPLE_BROWSE_SOAP.len(),
+                    SAMPLE_BROWSE_SOAP
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let server = MediaServer {
+            udn: "uuid:net-path".into(),
+            friendly_name: "Net Path".into(),
+            location: format!("http://127.0.0.1:{port}/rootDesc.xml"),
+            control_url: format!("http://127.0.0.1:{port}/ctl/ContentDir"),
+        };
+        let src = DlnaSource::from_server(server);
+        let listed = src.list("").unwrap();
+        assert_eq!(listed.entries.len(), 2);
+        assert_eq!(served.load(Ordering::SeqCst), 1, "one Browse POST");
+        // First page only: RequestedCount capped at BROWSE_PAGE_CAP.
+        let req = request.lock().unwrap();
+        assert!(
+            req.contains("<StartingIndex>0</StartingIndex>")
+                && req.contains(&format!(
+                    "<RequestedCount>{BROWSE_PAGE_CAP}</RequestedCount>"
+                )),
+            "{req}"
+        );
+        drop(req);
+        // Second call: served from the page cache, not the (now closed) server.
+        let cached = src.list("").unwrap();
+        assert_eq!(cached.entries.len(), 2);
+        assert_eq!(served.load(Ordering::SeqCst), 1, "cache must not re-post");
+    }
+
+    /// UPnP 701 "No such object" is a missing path, not a transport failure.
+    #[test]
+    fn missing_object_fault_reads_as_not_found() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let _ = read_full_request(&mut s);
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                SAMPLE_BROWSE_FAULT.len(),
+                SAMPLE_BROWSE_FAULT
+            );
+            let _ = s.write_all(resp.as_bytes());
+        });
+
+        let server = MediaServer {
+            udn: "uuid:faulty".into(),
+            friendly_name: "Faulty".into(),
+            location: format!("http://127.0.0.1:{port}/rootDesc.xml"),
+            control_url: format!("http://127.0.0.1:{port}/ctl/ContentDir"),
+        };
+        let src = DlnaSource::from_server(server);
+        match src.list("99").unwrap_err() {
+            SourceError::NotFound { path } => assert_eq!(path, "99"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]
@@ -673,5 +1065,92 @@ mod tests {
         };
         assert_eq!(err.message(), "timed out: DLNA discovery");
         assert_eq!(DISCOVER_TIMEOUT_MS, 8_000);
+    }
+
+    /// One local server, two connections: first the device description
+    /// (`describe`), then the ContentDirectory Browse POST answered with the
+    /// recorded `SAMPLE_BROWSE_SOAP` (task 2.1).
+    #[test]
+    fn describe_and_browse_page_round_trip_over_http() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
+                requests.push(read_full_request(&mut s));
+                let body = if requests.len() == 1 {
+                    SAMPLE_DEVICE_XML.to_string()
+                } else {
+                    SAMPLE_BROWSE_SOAP.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+            requests
+        });
+
+        let base = format!("http://127.0.0.1:{port}");
+        let budget = Duration::from_secs(2);
+        let server_desc = describe(&format!("{base}/rootDesc.xml"), budget).unwrap();
+        assert_eq!(server_desc.friendly_name, "Living Room NAS");
+        assert_eq!(
+            server_desc.control_url,
+            format!("{base}/ctl/ContentDir")
+        );
+
+        let page = browse_page(&server_desc.control_url, OBJECT_ID_ROOT, budget).unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].name, "Movies");
+        assert_eq!(page.entries[1].kind, EntryKind::Video);
+
+        let requests = server.join().unwrap();
+        let post = requests.get(1).expect("second request is the Browse POST");
+        assert!(post.starts_with("POST /ctl/ContentDir HTTP/1.1"), "{post}");
+        assert!(
+            post.contains("SOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\""),
+            "{post}"
+        );
+        assert!(post.contains("<ObjectID>0</ObjectID>"), "{post}");
+    }
+
+    /// UPnP faults travel as HTTP 500 bodies; `browse_page` must surface
+    /// them as `SourceError::Upnp`, not as a transport failure.
+    #[test]
+    fn browse_page_keeps_upnp_fault_status() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let _ = read_full_request(&mut s);
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                SAMPLE_BROWSE_FAULT.len(),
+                SAMPLE_BROWSE_FAULT
+            );
+            let _ = s.write_all(resp.as_bytes());
+        });
+
+        let url = format!("http://127.0.0.1:{port}/ctl/ContentDir");
+        match browse_page(&url, "99", Duration::from_secs(2)) {
+            Err(SourceError::Upnp { code, .. }) => assert_eq!(code, 701),
+            other => panic!("expected Upnp fault, got {other:?}"),
+        }
     }
 }

@@ -18,6 +18,10 @@ pub struct View {
     pub store: ResumeStore,
     pub add: Option<AddSource>,
     pub added: Vec<String>,
+    /// In-flight SSDP discovery results shared with the worker thread
+    /// (network-source-browsing D5); present only while the Add dialog is
+    /// open, so the `Added` action can resolve the picked name.
+    pub discovery: Option<crate::discovery::DiscoveryHandle>,
     pub sources: SourceStore,
     pub vault: CredentialVault,
     pub settings: Settings,
@@ -38,6 +42,7 @@ impl Default for View {
             store: ResumeStore::in_memory(),
             add: None,
             added: Vec::new(),
+            discovery: None,
             sources: SourceStore::in_memory(),
             vault: CredentialVault::in_memory(),
             settings: Settings::default(),
@@ -109,9 +114,25 @@ fn handle_add(view: &View, key: Key) -> View {
         return next;
     };
     match harbor_ui_kit::apply_add_key(add, key) {
-        AddAction::Close => next.add = None,
-        AddAction::Added(name) => {
+        AddAction::Close => {
             next.add = None;
+            next.discovery = None;
+        }
+        AddAction::Added(name) => {
+            // D5: a picked discovery result becomes a persisted SourceConfig;
+            // synthetic names (tests, re-adds) just join the `added` list.
+            let server = next.discovery.as_ref().and_then(|shared| {
+                let servers = shared.0.lock().unwrap_or_else(|e| e.into_inner());
+                servers
+                    .iter()
+                    .find(|s| s.friendly_name == name)
+                    .cloned()
+            });
+            next.add = None;
+            next.discovery = None;
+            if let Some(server) = &server {
+                next.sources.put(SourceConfig::dlna(server));
+            }
             if !next.added.contains(&name) {
                 next.added.push(name);
             }
@@ -133,6 +154,7 @@ fn handle_add(view: &View, key: Key) -> View {
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| format!("{}/{}", form.host, form.share));
             next.add = None;
+            next.discovery = None;
             if !next.added.contains(&name) {
                 next.added.push(name);
             }

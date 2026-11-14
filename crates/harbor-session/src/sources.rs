@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use harbor_sources::{Kind, SmbCreds};
+use harbor_sources::{Kind, MediaServer, SmbCreds};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceConfig {
@@ -19,6 +19,24 @@ pub struct SourceConfig {
 }
 
 impl SourceConfig {
+    /// A discovered DLNA MediaServer (network-source-browsing D5). The id
+    /// matches `DlnaSource::from_server` so browse and playback resolve the
+    /// same key.
+    pub fn dlna(server: &MediaServer) -> Self {
+        Self {
+            id: format!("dlna:{}", server.udn),
+            kind: Kind::Dlna,
+            name: server.friendly_name.clone(),
+            local_root: None,
+            dlna_udn: Some(server.udn.clone()),
+            dlna_control_url: Some(server.control_url.clone()),
+            smb_host: None,
+            smb_share: None,
+            smb_username: None,
+            smb_domain: None,
+        }
+    }
+
     pub fn smb(id: &str, host: &str, share: &str, username: &str, domain: &str) -> Self {
         let name = if username.is_empty() {
             format!("{host}/{share}")

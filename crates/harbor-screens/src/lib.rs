@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod catalog;
+pub mod discovery;
 pub mod home;
 pub mod nav;
 pub mod player;
@@ -13,6 +14,7 @@ use harbor_ui::Focus;
 use harbor_ui_kit::{AddSource, HudState};
 
 pub use catalog::{build_catalog, refresh_catalog, Catalog};
+pub use discovery::poll_discovery;
 pub use nav::{handle, persist, tick_add, View};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

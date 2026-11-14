@@ -51,6 +51,7 @@ pub fn run() -> Result<(), String> {
                 log("screen end");
             }
         }
+        harbor_screens::poll_discovery(&mut view);
         harbor_screens::tick_add(&mut view);
         let mut frame = win.begin();
         harbor_screens::draw_lang(
