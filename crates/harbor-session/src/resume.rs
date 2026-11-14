@@ -83,6 +83,14 @@ impl ResumeStore {
         }
     }
 
+    /// Every resume, most recently updated first — drives the Continue
+    /// Watching shelf. Replays whatever the log file holds after `open`.
+    pub fn iter(&self) -> Vec<Resume> {
+        let mut items = self.items.clone();
+        items.sort_by(|a, b| b.updated_unix.cmp(&a.updated_unix));
+        items
+    }
+
     fn flush(&self) {
         if self.path.as_os_str().is_empty() {
             return;
@@ -220,5 +228,40 @@ mod tests {
             updated_unix: 0,
         });
         assert!(store.get("demo", "the-river.mkv").is_none());
+    }
+
+    #[test]
+    fn iter_is_sorted_by_updated_desc_and_round_trips() {
+        let path = std::env::temp_dir().join(format!(
+            "harbor-resume-iter-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            "demo\told.mkv\t5000000000\t90000000000\t100\n\
+             demo\tnew.mkv\t7000000000\t90000000000\t300\n\
+             demo\tmid.mkv\t6000000000\t90000000000\t200\n",
+        )
+        .unwrap();
+
+        let store = ResumeStore::open(&path);
+        let items = store.iter();
+        let ids: Vec<&str> = items.iter().map(|r| r.entry_id.as_str()).collect();
+        assert_eq!(ids, vec!["new.mkv", "mid.mkv", "old.mkv"]);
+        assert_eq!(items[0].position_ns, 7_000_000_000);
+        assert_eq!(items[2].source_id, "demo");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn iter_is_empty_for_a_fresh_store() {
+        assert!(ResumeStore::in_memory().iter().is_empty());
+        let missing = std::env::temp_dir().join(format!(
+            "harbor-resume-none-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&missing);
+        assert!(ResumeStore::open(&missing).iter().is_empty());
     }
 }

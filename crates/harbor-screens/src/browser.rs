@@ -53,7 +53,7 @@ mod tests {
     #[test]
     fn browser_paints_sort_az_and_files() {
         let mut r = Recorder::default();
-        draw(&mut r, &Catalog::demo(), Focus { row: 2, col: 0 });
+        draw(&mut r, &Catalog::fixture(), Focus { row: 2, col: 0 });
         let texts = r
             .ops
             .iter()

@@ -12,7 +12,7 @@ use harbor_ui::label::Label;
 use harbor_ui::Focus;
 use harbor_ui_kit::{AddSource, HudState};
 
-pub use catalog::Catalog;
+pub use catalog::{build_catalog, refresh_catalog, Catalog};
 pub use nav::{handle, persist, tick_add, View};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn demo_screens_paint_distinct_titles() {
-        let cat = Catalog::demo();
+        let cat = Catalog::fixture();
         for (screen, title) in [
             (Screen::Home, "Harbor"),
             (Screen::Browser, "Browser"),
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn zh_hans_chrome_and_settings() {
-        let cat = Catalog::demo();
+        let cat = Catalog::fixture();
         let mut r = Recorder::default();
         draw_lang(
             &mut r,
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn content_text_meets_caption_floor() {
-        let cat = Catalog::demo();
+        let cat = Catalog::fixture();
         let screens = [Screen::Home, Screen::Browser, Screen::Settings];
         for screen in screens {
             let mut r = Recorder::default();

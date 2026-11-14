@@ -1,6 +1,6 @@
 use harbor_base::{log, rundir};
 use harbor_gfx::Window;
-use harbor_screens::{self, Catalog, Screen, View};
+use harbor_screens::{self, Screen, View};
 use harbor_session::ResumeStore;
 
 fn smoke_frames() -> Option<u32> {
@@ -13,16 +13,17 @@ pub fn run() -> Result<(), String> {
     log("boot");
     let mut win = Window::open("Harbor")?;
     let smoke = smoke_frames();
-    let catalog = Catalog::demo();
     let mut n: u32 = 0;
     let mut view = View::with_store(ResumeStore::open(rundir().join("resume.log")));
+    harbor_screens::refresh_catalog(&mut view);
+    log_catalog(&view, "boot");
     loop {
         let (quit, keys) = win.poll_keys();
         if quit {
             break;
         }
         for k in keys {
-            let next = harbor_screens::handle(&view, &catalog, k);
+            let next = harbor_screens::handle(&view, k);
             if next.screen != view.screen {
                 log(&format!("screen {:?}", next.screen));
             }
@@ -30,6 +31,10 @@ pub fn run() -> Result<(), String> {
                 log(&format!("focus {:?}", next.focus));
             }
             view = next;
+        }
+        if view.needs_refresh {
+            harbor_screens::refresh_catalog(&mut view);
+            log_catalog(&view, "refresh");
         }
         if view.screen == Screen::Player {
             if let Some(hud) = view.hud.as_mut() {
@@ -42,7 +47,7 @@ pub fn run() -> Result<(), String> {
                 }
             }
             if view.hud.as_ref().map(harbor_ui_kit::ended).unwrap_or(false) {
-                view = harbor_screens::handle(&view, &catalog, harbor_platform::Key::Back);
+                view = harbor_screens::handle(&view, harbor_platform::Key::Back);
                 log("screen end");
             }
         }
@@ -51,7 +56,7 @@ pub fn run() -> Result<(), String> {
         harbor_screens::draw_lang(
             &mut frame,
             view.screen,
-            &catalog,
+            &view.catalog,
             view.focus,
             view.hud.as_ref(),
             view.add.as_ref(),
@@ -67,6 +72,16 @@ pub fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn log_catalog(view: &View, why: &str) {
+    log(&format!(
+        "catalog[{why}] sources={} files={} recent={} resume={}",
+        view.catalog.sources.len(),
+        view.catalog.files.len(),
+        view.catalog.recently_added.len(),
+        view.catalog.continue_watching.len()
+    ));
 }
 
 #[no_mangle]

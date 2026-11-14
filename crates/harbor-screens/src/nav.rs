@@ -21,6 +21,11 @@ pub struct View {
     pub sources: SourceStore,
     pub vault: CredentialVault,
     pub settings: Settings,
+    /// Derived state: rebuilt by `refresh_catalog` from `sources`, `store`,
+    /// and local discovery (design D2). Empty until the first refresh.
+    pub catalog: Catalog,
+    /// Set whenever the inputs above change; the app loop refreshes on it.
+    pub needs_refresh: bool,
     stack: Vec<(Screen, Focus)>,
 }
 
@@ -36,6 +41,8 @@ impl Default for View {
             sources: SourceStore::in_memory(),
             vault: CredentialVault::in_memory(),
             settings: Settings::default(),
+            catalog: Catalog::empty(),
+            needs_refresh: false,
             stack: Vec::new(),
         }
     }
@@ -52,9 +59,31 @@ impl View {
             ..Self::default()
         }
     }
+
+    /// Start from an explicit catalog (tests, boot refresh).
+    pub fn with_catalog(catalog: Catalog) -> Self {
+        Self {
+            catalog,
+            ..Self::default()
+        }
+    }
 }
 
-pub fn handle(view: &View, catalog: &Catalog, key: Key) -> View {
+pub fn handle(view: &View, key: Key) -> View {
+    let next = dispatch(view, key);
+    // Returning to Home/Browser must show current data (spec: "Source changes
+    // reflect without restart"); the app loop refreshes on the flag.
+    if next.screen != view.screen && matches!(next.screen, Screen::Home | Screen::Browser) {
+        View {
+            needs_refresh: true,
+            ..next
+        }
+    } else {
+        next
+    }
+}
+
+fn dispatch(view: &View, key: Key) -> View {
     if view.add.is_some() {
         return handle_add(view, key);
     }
@@ -64,12 +93,12 @@ pub fn handle(view: &View, catalog: &Catalog, key: Key) -> View {
     match key {
         Key::Left | Key::Right | Key::Up | Key::Down => {
             let mut next = view.clone();
-            next.focus = reduce(view.focus, &rows(view.screen, catalog), key);
+            next.focus = reduce(view.focus, &rows(view.screen, &view.catalog), key);
             next.hud = None;
             next
         }
         Key::Back => pop(view),
-        Key::Ok => on_ok(view, catalog),
+        Key::Ok => on_ok(view),
         _ => view.clone(),
     }
 }
@@ -86,6 +115,7 @@ fn handle_add(view: &View, key: Key) -> View {
             if !next.added.contains(&name) {
                 next.added.push(name);
             }
+            next.needs_refresh = true;
         }
         AddAction::AddedSmb(form) => {
             let id = harbor_session::smb_id(&form.host, &form.share);
@@ -106,6 +136,7 @@ fn handle_add(view: &View, key: Key) -> View {
             if !next.added.contains(&name) {
                 next.added.push(name);
             }
+            next.needs_refresh = true;
         }
         AddAction::None => {}
     }
@@ -169,12 +200,15 @@ fn pop(view: &View) -> View {
             sources: view.sources.clone(),
             vault: view.vault.clone(),
             settings: view.settings.clone(),
+            catalog: view.catalog.clone(),
+            needs_refresh: view.needs_refresh,
             ..View::default()
         },
     }
 }
 
-fn on_ok(view: &View, catalog: &Catalog) -> View {
+fn on_ok(view: &View) -> View {
+    let catalog = &view.catalog;
     match view.screen {
         Screen::Home => {
             let screen = if catalog.is_empty() || view.focus.row == 3 {
@@ -261,39 +295,38 @@ pub fn persist(view: &mut View) {
 
     #[test]
     fn populated_home_ok_opens_browser_sources_ok_opens_settings() {
-        let cat = Catalog::demo();
-        let browser = handle(&View::default(), &cat, Key::Ok);
+        let cat = Catalog::fixture();
+        let browser = handle(&View::with_catalog(cat.clone()), Key::Ok);
         assert_eq!(browser.screen, Screen::Browser);
         assert_eq!(browser.depth(), 1);
 
-        let mut sources = View::default();
+        let mut sources = View::with_catalog(cat.clone());
         sources.focus.row = 3;
-        let settings = handle(&sources, &cat, Key::Ok);
+        let settings = handle(&sources, Key::Ok);
         assert_eq!(settings.screen, Screen::Settings);
         assert_eq!(settings.depth(), 1);
     }
 
     #[test]
     fn empty_home_ok_opens_settings() {
-        let next = handle(&View::default(), &Catalog::empty(), Key::Ok);
+        let next = handle(&View::default(), Key::Ok);
         assert_eq!(next.screen, Screen::Settings);
     }
 
     #[test]
     fn back_on_home_stays() {
-        let home = handle(&View::default(), &Catalog::demo(), Key::Back);
+        let home = handle(&View::default(), Key::Back);
         assert_eq!(home, View::default());
     }
 
     #[test]
     fn back_restores_previous_focus() {
-        let cat = Catalog::demo();
         let mut home = View::default();
         home.focus.row = 3;
         home.focus.col = 1;
-        let settings = handle(&home, &cat, Key::Ok);
+        let settings = handle(&home, Key::Ok);
         assert_eq!(settings.screen, Screen::Settings);
-        let back = handle(&settings, &cat, Key::Back);
+        let back = handle(&settings, Key::Back);
         assert_eq!(back.screen, Screen::Home);
         assert_eq!(back.focus, home.focus);
         assert_eq!(back.depth(), 0);
@@ -301,36 +334,35 @@ pub fn persist(view: &mut View) {
 
     #[test]
     fn keyboard_walk_home_browser_back_settings() {
-        let cat = Catalog::demo();
-        let mut v = View::default();
-        v = handle(&v, &cat, Key::Ok);
+        let cat = Catalog::fixture();
+        let mut v = View::with_catalog(cat.clone());
+        v = handle(&v, Key::Ok);
         assert_eq!(v.screen, Screen::Browser);
-        v = handle(&v, &cat, Key::Back);
+        v = handle(&v, Key::Back);
         assert_eq!(v.screen, Screen::Home);
         v.focus.row = 3;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert_eq!(v.screen, Screen::Settings);
-        v = handle(&v, &cat, Key::Back);
+        v = handle(&v, Key::Back);
         assert_eq!(v.screen, Screen::Home);
     }
 
     fn browser_on_file() -> View {
-        let cat = Catalog::demo();
-        let mut v = handle(&View::default(), &cat, Key::Ok);
+        let cat = Catalog::fixture();
+        let mut v = handle(&View::with_catalog(cat.clone()), Key::Ok);
         v.focus.row = 2;
         v.focus.col = 2;
-        handle(&v, &cat, Key::Ok)
+        handle(&v, Key::Ok)
     }
 
     #[test]
     fn browser_file_opens_player_back_unloads() {
-        let cat = Catalog::demo();
         let player = browser_on_file();
         assert_eq!(player.screen, Screen::Player);
         let hud = player.hud.as_ref().expect("hud");
         assert_eq!(hud.title, "the-river.mkv");
         assert!(!hud.paused);
-        let back = handle(&player, &cat, Key::Back);
+        let back = handle(&player, Key::Back);
         assert_eq!(back.screen, Screen::Browser);
         assert!(back.hud.is_none());
         assert_eq!(back.focus.row, 2);
@@ -338,90 +370,85 @@ pub fn persist(view: &mut View) {
 
     #[test]
     fn player_ok_pauses_arrows_seek() {
-        let cat = Catalog::demo();
         let mut v = browser_on_file();
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert!(v.hud.as_ref().unwrap().paused);
         v.hud.as_mut().unwrap().position_ns = 20_000_000_000;
-        v = handle(&v, &cat, Key::Right);
+        v = handle(&v, Key::Right);
         assert_eq!(v.hud.as_ref().unwrap().position_ns, 30_000_000_000);
-        v = handle(&v, &cat, Key::Left);
+        v = handle(&v, Key::Left);
         assert_eq!(v.hud.as_ref().unwrap().position_ns, 20_000_000_000);
     }
 
     #[test]
     fn refuse_ok_returns() {
-        let cat = Catalog::demo();
         let mut v = browser_on_file();
         v.hud = Some(HudState::refused(
             "unsupported_codec: This TV cannot decode VP9",
         ));
-        let back = handle(&v, &cat, Key::Ok);
+        let back = handle(&v, Key::Ok);
         assert_eq!(back.screen, Screen::Browser);
         assert!(back.hud.is_none());
     }
 
     #[test]
     fn unavailable_ok_returns() {
-        let cat = Catalog::demo();
         let mut v = browser_on_file();
         v.hud = Some(HudState::unavailable());
-        let back = handle(&v, &cat, Key::Ok);
+        let back = handle(&v, Key::Ok);
         assert_eq!(back.screen, Screen::Browser);
         assert!(back.hud.is_none());
     }
 
     #[test]
     fn pause_persists_and_reopen_offers_continue() {
-        let cat = Catalog::demo();
         let mut v = browser_on_file();
         v.hud.as_mut().unwrap().position_ns = 12_000_000_000;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert!(v.store.get(DEMO_SOURCE, "the-river.mkv").is_some());
-        v = handle(&v, &cat, Key::Back);
+        v = handle(&v, Key::Back);
         v.focus.row = 2;
         v.focus.col = 2;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         let hud = v.hud.as_ref().unwrap();
         assert_eq!(hud.prompt.as_ref().unwrap().position_ns, 12_000_000_000);
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert_eq!(v.hud.as_ref().unwrap().position_ns, 12_000_000_000);
         assert!(v.hud.as_ref().unwrap().prompt.is_none());
     }
 
     #[test]
     fn yellow_opens_subs_back_stays_on_player() {
-        let cat = Catalog::demo();
         let mut v = browser_on_file();
-        v = handle(&v, &cat, Key::Yellow);
+        v = handle(&v, Key::Yellow);
         assert!(v.hud.as_ref().unwrap().menu.is_some());
-        v = handle(&v, &cat, Key::Back);
+        v = handle(&v, Key::Back);
         assert_eq!(v.screen, Screen::Player);
         assert!(v.hud.as_ref().unwrap().menu.is_none());
     }
 
     #[test]
     fn settings_add_source_dlna_timeout_then_pick_server() {
-        let cat = Catalog::demo();
-        let mut v = View::default();
+        let cat = Catalog::fixture();
+        let mut v = View::with_catalog(cat.clone());
         v.focus.row = 3;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert_eq!(v.screen, Screen::Settings);
         v.focus.row = 1;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert!(v.add.is_some());
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         for _ in 0..harbor_ui_kit::TIMEOUT_FRAMES {
             tick_add(&mut v);
         }
         assert_eq!(v.add.as_ref().unwrap().step, harbor_ui_kit::AddStep::Empty);
-        v = handle(&v, &cat, Key::Back);
+        v = handle(&v, Key::Back);
         assert_eq!(v.screen, Screen::Settings);
         assert!(v.add.is_some());
         v.add = Some(harbor_ui_kit::AddSource::discovering(vec![
             "Living Room NAS".into(),
         ]));
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert!(v.add.is_none());
         assert_eq!(v.added, vec!["Living Room NAS".to_string()]);
         assert_eq!(v.screen, Screen::Settings);
@@ -429,14 +456,14 @@ pub fn persist(view: &mut View) {
 
     #[test]
     fn add_smb_persists_source_password_in_vault() {
-        let cat = Catalog::demo();
-        let mut v = View::default();
+        let cat = Catalog::fixture();
+        let mut v = View::with_catalog(cat.clone());
         v.focus.row = 3;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         v.focus.row = 1;
-        v = handle(&v, &cat, Key::Ok);
-        v = handle(&v, &cat, Key::Down);
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
+        v = handle(&v, Key::Down);
+        v = handle(&v, Key::Ok);
         let form = match v.add.as_mut().map(|a| &mut a.step) {
             Some(harbor_ui_kit::AddStep::Smb(form)) => form,
             other => panic!("{other:?}"),
@@ -447,7 +474,7 @@ pub fn persist(view: &mut View) {
         form.password = "s3cret".into();
         form.domain = "HOME".into();
         form.focus = 5;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert!(v.add.is_none());
         let cfg = v.sources.get("smb:nas/media").unwrap();
         assert_eq!(cfg.smb_host.as_deref(), Some("nas"));
@@ -490,7 +517,7 @@ pub fn persist(view: &mut View) {
             }
             other => panic!("{other:?}"),
         }
-        v = handle(&v, &Catalog::demo(), Key::Down);
+        v = handle(&v, Key::Down);
         match &v.add.as_ref().unwrap().step {
             harbor_ui_kit::AddStep::Smb(form) => assert_eq!(form.focus, 3),
             other => panic!("{other:?}"),
@@ -516,7 +543,7 @@ pub fn persist(view: &mut View) {
             harbor_ui_kit::AddStep::SmbUnreachable(_) => {}
             other => panic!("{other:?}"),
         }
-        v = handle(&v, &Catalog::demo(), Key::Ok);
+        v = handle(&v, Key::Ok);
         match v.add.unwrap().step {
             harbor_ui_kit::AddStep::Smb(form) => assert_eq!(form.host, "nas"),
             other => panic!("{other:?}"),
@@ -525,26 +552,88 @@ pub fn persist(view: &mut View) {
 
     #[test]
     fn settings_ok_on_language_row_cycles_lang() {
-        let cat = Catalog::demo();
-        let mut v = View::default();
+        let cat = Catalog::fixture();
+        let mut v = View::with_catalog(cat.clone());
         v.focus.row = 3;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert_eq!(v.screen, Screen::Settings);
         assert_eq!(v.settings.ui_lang, harbor_platform::Lang::En);
         v.focus.row = crate::settings::lang_row_index(&cat);
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert_eq!(v.settings.ui_lang, harbor_platform::Lang::ZhHans);
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert_eq!(v.settings.ui_lang, harbor_platform::Lang::En);
         assert!(v.add.is_none());
     }
 
     #[test]
     fn ninety_percent_clears_resume() {
-        let cat = Catalog::demo();
         let mut v = browser_on_file();
         v.hud.as_mut().unwrap().position_ns = 81_000_000_000;
-        v = handle(&v, &cat, Key::Ok);
+        v = handle(&v, Key::Ok);
         assert!(v.store.get(DEMO_SOURCE, "the-river.mkv").is_none());
+    }
+
+    #[test]
+    fn adding_a_source_marks_refresh_and_home_draws_it() {
+        let cat = Catalog::fixture();
+        let mut v = View::with_catalog(cat.clone());
+        v.focus.row = 3;
+        v = handle(&v, Key::Ok); // Home -> Settings
+        assert_eq!(v.screen, Screen::Settings);
+        v.focus.row = crate::settings::add_row(&v.catalog);
+        v = handle(&v, Key::Ok); // open Add Source
+        assert!(v.add.is_some());
+        v = handle(&v, Key::Down);
+        v = handle(&v, Key::Ok); // pick SMB
+        let form = match v.add.as_mut().map(|a| &mut a.step) {
+            Some(harbor_ui_kit::AddStep::Smb(form)) => form,
+            other => panic!("{other:?}"),
+        };
+        form.host = "nas".into();
+        form.share = "media".into();
+        form.focus = 5;
+        v = handle(&v, Key::Ok);
+        assert!(v.add.is_none());
+        assert!(
+            v.needs_refresh,
+            "saving a source must mark the catalog stale"
+        );
+
+        crate::refresh_catalog(&mut v);
+        assert!(!v.needs_refresh, "refresh must clear the flag");
+        assert!(
+            v.catalog.sources.iter().any(|n| n.contains("nas/media")),
+            "new source missing from {:?}",
+            v.catalog.sources
+        );
+
+        // the next Home draw shows the new source name
+        let mut rec = harbor_ui::draw::Recorder::default();
+        crate::draw(
+            &mut rec,
+            Screen::Home,
+            &v.catalog,
+            Focus::default(),
+            None,
+            None,
+        );
+        let texts: Vec<&str> = rec
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                harbor_ui::draw::DrawOp::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("nas/media")),
+            "Home must draw the new source: {texts:?}"
+        );
+
+        // returning to Home marks it stale again (spec: reflect without restart)
+        v = handle(&v, Key::Back); // Settings -> Home
+        assert_eq!(v.screen, Screen::Home);
+        assert!(v.needs_refresh, "entering Home must re-read the sources");
     }
 }

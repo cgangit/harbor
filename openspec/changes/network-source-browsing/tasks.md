@@ -1,0 +1,34 @@
+# Tasks
+
+## 1. HTTP helper and DLNA discovery (design D1, D5)
+
+- [ ] 1.1 Extract a minimal `http::{get, post_soap}` helper from `handle.rs`'s Range code (redirect cap 3, read/write timeouts at the spec's 8 s / 10 s budgets); verify with `TcpListener` fixture tests covering body, redirect, and timeout classification (`cargo test -p harbor-sources`).
+- [ ] 1.2 Implement SSDP discovery: multicast M-SEARCH to `239.255.255.250:1900`, collect responses for 8 s, parse with the existing `parse_ssdp` / `parse_device_description`; verify with a local UDP responder fixture test that returns two known devices (`cargo test -p harbor-sources`).
+- [ ] 1.3 Feed real discovery results into `AddSource::discovering` (replacing the hard-coded server names) and turn the chosen server into a `SourceConfig` through the existing `Added` action; verify with a test that a discovered server lands in `SourceStore` (`cargo test -p harbor-screens`).
+
+## 2. DLNA browse (design D1)
+
+- [ ] 2.1 Fetch the device description and POST the ContentDirectory `Browse` (`browse_soap`) through the new helper, parsing with `parse_browse_response`; verify against a `TcpListener` serving the recorded `SAMPLE_BROWSE_SOAP` (`cargo test -p harbor-sources`).
+- [ ] 2.2 Give `DlnaSource::list` a network path with a page cache (first page, `RequestedCount` capped at 200); verify that a cached fixture page is still served offline and that the network path fills the cache from the local server (`cargo test -p harbor-sources`).
+
+## 3. SMB client (design D2)
+
+- [ ] 3.1 Time-boxed spike: evaluate a pure-Rust SMB2 crate against `libsmb2` FFI — NTLMv2 auth with and without a password, positional `read_at`, and an `armv7-unknown-linux-gnueabi` build (this host cannot cross-compile; verify the ARM side in CI via a push or `workflow_dispatch` on `build-ipk.yml`); verify by recording the verdict and its evidence (test output) in design.md D2.
+- [ ] 3.2 Implement connect + readdir behind `SmbSource::list` with errors routed through the existing `classify_connect` / `classify_nt_status`, keeping the fixture constructors untouched; verify with offline unit tests plus an opt-in live test (`HARBOR_SMB_LIVE=1`, local Samba) (`cargo test -p harbor-sources`).
+
+## 4. Async browse, loading row, wiring (deferred tasks 4.1/4.2 of `wire-input-and-real-data`; design D3, D4)
+
+- [ ] 4.1 Add the browse queue (`Arc<Mutex<Vec<BrowseResult>>>`) plus `View.loading` and `View.browse_error`, with a drain step that clears them as it fills `catalog.files`; verify with a test that posts a fixture page and finds it in `View` after one drain (`cargo test -p harbor-screens`).
+- [ ] 4.2 Spawn the worker on DLNA/SMB source open and draw the Browser loading row (and the failure row) with `rows()` counting them so focus stays valid; verify with a stub source whose `list()` blocks briefly that `handle` keeps responding and the loading row shows until the post arrives (`cargo test -p harbor-screens`).
+- [ ] 4.3 Wire the trigger: selecting a configured source (Settings source row, sources shelf) starts a listing; verify with a nav test that selecting an SMB source sets `loading` and the drained page reaches `catalog.files` (`cargo test -p harbor-screens`).
+
+## 5. Integration and verification
+
+- [ ] 5.1 Run `make check` (workspace tests + `ci/test_mkipk.py`) and keep it green — the gate for every group above.
+- [ ] 5.2 Run the LAN checklist: browse MiniDLNA/ReadyMedia and a Samba share (with and without password) from this machine, both through the new async path; verify the documented commands in `docs/design.md` run as written and record the results there.
+- [ ] 5.3 On a real webOS 4.0+ TV: discover a server, browse it, list a share, and confirm input stays responsive during the 8 s SSDP and 10 s SMB waits; verify by reading the app log on device and record the outcome in `docs/design.md`.
+
+## Workflow follow-up
+
+- Archive this change after implementation plus the LAN and device checks are complete.
+- Playback wiring (`harbor-media` Engine / StarfishSink / HostSink) and the Settings edit/remove flows remain separate changes, shared with `wire-input-and-real-data`.

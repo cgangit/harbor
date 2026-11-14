@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn demo_home_paints_shelves() {
         let mut r = Recorder::default();
-        draw(&mut r, &Catalog::demo(), Focus { row: 1, col: 0 });
+        draw(&mut r, &Catalog::fixture(), Focus { row: 1, col: 0 });
         let texts = r
             .ops
             .iter()

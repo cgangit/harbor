@@ -1,7 +1,7 @@
 # Harbor — webOS Native Player
 
 Feature Name: webos-native-player
-Updated: 2026-11-05
+Updated: 2026-11-14
 
 > Requirements for this feature now live in OpenSpec at `openspec/specs/`
 > (capabilities: `app-shell`, `browsing`, `sources`, `playback`, `resume`,
@@ -178,6 +178,28 @@ Matches the race-freedom split in PlxNative's engine-port design, reimplemented:
 9. **Couch type.** Content text uses the size scale; caption floor is 24 px.
 10. **Host green ≠ decoder proof.** Device checklist is required for Starfish/ACB/fps claims.
 
+## Runtime wiring (change `wire-input-and-real-data`)
+
+### Input
+
+- `harbor_gfx::Window::poll_keys` normalizes three event shapes through pure helpers: scancode keydown (`from_sdl_scancode`), keycode-only keydown (`from_sdl_keycode` — what webOS-style events may deliver), and a left mouse-button press → `Key::Ok` (Magic Remote click activates exactly like OK). Key repeats are ignored; host `Q` still quits.
+- **Queue filter:** `Window::open` installs an `SDL_SetEventFilter` allowlist (`is_decodable_event_type`). The host's `libSDL2-2.0.so.0` is sdl2-compat (SDL2 API over SDL3) and leaks SDL3-native window event numbers (`0x202..0x20F`; `0x207` observed at boot); sdl2-rs 0.37's `EventType::try_from` aborts when transmuting those, which is why `make smoke` crashed before this change. Types outside the allowlist are dropped at the queue — fail-closed, nothing we consume lives outside it.
+- **Diagnostics:** the first 20 raw input events are appended to `events.log` as `evt <class> codes=[..] n/20`, so an unverified remote's codes can be read straight off the device and added to `from_sdl_scancode` / `from_sdl_keycode` in one line.
+
+### Catalog refresh
+
+- `View` owns `catalog` (derived state) plus `needs_refresh`; `handle(&View, Key)` no longer takes a catalog argument, and `draw` reads `view.catalog`.
+- `refresh_catalog(&mut View)` rebuilds it from `SourceStore` (configured sources), `ResumeStore::iter()` (Continue Watching, newest first) and `harbor_sources::discover()` (local mounts; `HARBOR_MEDIA` overrides discovery on the host). It runs at boot and whenever `needs_refresh` is set — the flag is set when a source is saved and on transitions into Home/Browser, so source changes show up without a restart.
+- Local listing is a bounded BFS (depth ≤ 4, ≤ 200 videos) so files under `Movies/` reach Recently Added without scanning an unbounded tree on the UI thread. Network sources are not listed yet: `DlnaSource::list` reads a page cache, `SmbSource::list` reads an in-memory map, and no socket code exists — deferred to change `network-source-browsing`.
+- `Catalog::demo()` is now `Catalog::fixture()`, `#[cfg(test)]` only; production code cannot construct demo data.
+
+### Verification commands
+
+- `make check` — workspace tests plus `ci/test_mkipk.py`.
+- `make smoke` — boots the sim headless for `HARBOR_SMOKE_FRAMES` frames; must exit 0 and log `catalog[boot] …`.
+- `HARBOR_MEDIA=<dir> HARBOR_SMOKE_FRAMES=3 make smoke` — points discovery at a fixture tree; the boot log must show a non-zero file count.
+- `make sim` — interactive session: arrows / Enter / Escape navigate, a mouse click activates the focused item.
+
 ## Error Handling
 
 | Failure | User-visible | Engine |
@@ -201,10 +223,12 @@ Log every load / playing / seek / error line to `$XDG_RUNTIME_DIR/harbor/events.
 - DIDL-Lite parse fixtures (MediaServer Browse XML).
 - SSDP notify parse.
 - SMB URL / credential canonicalization (no network).
-- Resume store round-trip and 90% clear rule.
+- Resume store round-trip, 90% clear rule, and `iter()` ordering.
 - Focus reducer: Home empty-state, shelf wrap, Back stack.
 - Fake `VideoSink`: load/feed/pause/seek call order; BufferFull retry; ACB sequence on a 4.x fake.
 - Demux of checked-in tiny clips (H.264 MP4, HEVC MKV) into AU counts.
+- Key mapping: scancode and keycode paths agree; left click → `Key::Ok`; event-type allowlist accepts SDL2 and drops foreign types.
+- Catalog: `refresh_catalog` over in-memory stores, `build_catalog` over a fixture mount (subfolder videos included), empty degradation; adding a source marks the refresh and the next Home draw shows it.
 
 ### Simulator (`make sim`)
 

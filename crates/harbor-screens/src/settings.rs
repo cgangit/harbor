@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn settings_lists_demo_sources() {
         let mut r = Recorder::default();
-        draw(&mut r, &Catalog::demo(), Focus::default());
+        draw(&mut r, &Catalog::fixture(), Focus::default());
         let texts = r
             .ops
             .iter()
@@ -115,7 +115,7 @@ mod tests {
         let mut r = Recorder::default();
         draw_lang(
             &mut r,
-            &Catalog::demo(),
+            &Catalog::fixture(),
             Focus { row: 2, col: 0 },
             Lang::ZhHans,
         );
