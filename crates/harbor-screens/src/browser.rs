@@ -475,4 +475,194 @@ mod tests {
             "error row missing: {texts:?}"
         );
     }
+
+    /// Task 5.2 LAN checklist, opt-in with `HARBOR_LAN_LIVE=1`: every
+    /// network source goes through the real async path (`network_source` →
+    /// `start` → `drain`) against a live MiniDLNA — SSDP discovery, or
+    /// `HARBOR_DLN_LOCATION` to describe a known URL — and a live Samba
+    /// (`HARBOR_SMB_ADDR`, default `127.0.0.1:1445`): guest share without a
+    /// password, authenticated share with one, and a wrong password that
+    /// must arrive as a failure class.
+    #[test]
+    fn lan_live_browses_dlna_and_smb_through_async_path() {
+        if std::env::var("HARBOR_LAN_LIVE").as_deref() != Ok("1") {
+            return;
+        }
+
+        fn wait_for_drain(v: &mut View, budget: Duration) {
+            let deadline = Instant::now() + budget;
+            while !v.loading.is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "listing never posted: loading={:?} error={:?}",
+                    v.loading,
+                    v.browse_error
+                );
+                drain(v);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn browse(view: &mut View, name: &str, path: &str, budget: Duration) {
+            let source = network_source(view, name).expect("configured name resolves to a handle");
+            start(view, source, path);
+            assert!(!view.loading.is_empty());
+            wait_for_drain(view, budget);
+        }
+
+        fn store_name(view: &View, id: &str) -> String {
+            view.sources
+                .get(id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| panic!("no source {id}"))
+        }
+
+        /// A page carrying a video resource URL (DLNA names may drop the
+        /// extension — MiniDLNA titles are extension-less — so the `res`
+        /// URL is what says "media here").
+        fn has_media(v: &View) -> bool {
+            v.page.as_ref().is_some_and(|p| {
+                p.entries.iter().any(|e| {
+                    e.url
+                        .as_deref()
+                        .is_some_and(|u| u.to_ascii_lowercase().ends_with(".mkv") || u.to_ascii_lowercase().ends_with(".mp4"))
+                })
+            })
+        }
+
+        // --- DLNA: live SSDP discovery, then the discovered server lists.
+        let server = match std::env::var("HARBOR_DLN_LOCATION") {
+            Ok(location) => harbor_sources::describe(&location, Duration::from_secs(5))
+                .expect("HARBOR_DLN_LOCATION describes a MediaServer"),
+            Err(_) => {
+                let mut found = harbor_sources::discover_media_servers(
+                    harbor_sources::SSDP_MULTICAST,
+                    Duration::from_secs(8),
+                )
+                .expect("live SSDP discovery");
+                assert!(!found.is_empty(), "no MediaServer answered M-SEARCH");
+                // Other devices on a real LAN may answer first; the
+                // checklist pins the test server by friendly name when it
+                // says so.
+                if let Ok(want) = std::env::var("HARBOR_DLN_NAME") {
+                    found.retain(|s| s.friendly_name == want);
+                    assert!(
+                        !found.is_empty(),
+                        "no discovered MediaServer named {want:?}"
+                    );
+                }
+                found.into_iter().next().unwrap()
+            }
+        };
+        let mut v = View::default();
+        v.sources.put(SourceConfig::dlna(&server));
+        v.catalog = crate::build_catalog(&v.sources, &[], &[]);
+        let dlna_name = server.friendly_name.clone();
+        browse(&mut v, &dlna_name, "", Duration::from_secs(15));
+        assert!(
+            v.browse_error.is_none(),
+            "DLNA browse failed: {:?}",
+            v.browse_error
+        );
+        // MiniDLNA puts its content behind a "Browse Folders" container and
+        // titles entries extension-less; other servers list media at the
+        // root. Walk down (the follow-up `list(path)` path) until a video
+        // resource shows up — at most four levels deep.
+        for _ in 0..4 {
+            if has_media(&v) {
+                break;
+            }
+            let folder = v
+                .page
+                .as_ref()
+                .and_then(|p| p.entries.iter().find(|e| e.kind == EntryKind::Dir))
+                .map(|e| e.id.clone());
+            let Some(folder) = folder else {
+                break;
+            };
+            browse(&mut v, &dlna_name, &folder, Duration::from_secs(15));
+            assert!(
+                v.browse_error.is_none(),
+                "DLNA drill-down failed: {:?}",
+                v.browse_error
+            );
+        }
+        assert!(
+            has_media(&v),
+            "no .mkv/.mp4 resource within four folders: {:?} (page {:?})",
+            v.catalog.files,
+            v.page.as_ref().map(|p| p.entries.len())
+        );
+        assert!(v.page.is_some(), "page kept for folder drill-down");
+
+        // --- SMB without password: the guest share lists.
+        let addr = std::env::var("HARBOR_SMB_ADDR").unwrap_or_else(|_| "127.0.0.1:1445".into());
+        let guest_id = harbor_session::smb_id(&addr, "guest");
+        let mut g = View::default();
+        g.sources
+            .put(SourceConfig::smb(&guest_id, &addr, "guest", "", ""));
+        g.catalog = crate::build_catalog(&g.sources, &[], &[]);
+        let guest_name = store_name(&g, &guest_id);
+        browse(&mut g, &guest_name, "", Duration::from_secs(15));
+        assert!(
+            g.browse_error.is_none(),
+            "guest browse failed: {:?}",
+            g.browse_error
+        );
+        assert!(
+            g.catalog.files.iter().any(|f| f == "movie.mkv"),
+            "guest page missing movie.mkv: {:?}",
+            g.catalog.files
+        );
+
+        // --- SMB with password: the private share lists for `harbor`.
+        let priv_id = harbor_session::smb_id(&addr, "private");
+        let mut p = View::default();
+        p.sources.put(SourceConfig::smb(
+            &priv_id,
+            &addr,
+            "private",
+            "harbor",
+            "",
+        ));
+        p.vault.put(&priv_id, "harborpass");
+        p.catalog = crate::build_catalog(&p.sources, &[], &[]);
+        let priv_name = store_name(&p, &priv_id);
+        browse(&mut p, &priv_name, "", Duration::from_secs(15));
+        assert!(
+            p.browse_error.is_none(),
+            "authenticated browse failed: {:?}",
+            p.browse_error
+        );
+        assert!(
+            p.catalog.files.iter().any(|f| f == "private-movie.mkv"),
+            "private page missing private-movie.mkv: {:?}",
+            p.catalog.files
+        );
+
+        // --- Wrong password: the failure class arrives through the same
+        // path, with no page left behind.
+        let bad_id = harbor_session::smb_id(&addr, "bad-pass");
+        let mut b = View::default();
+        b.sources.put(SourceConfig::smb(
+            &bad_id,
+            &addr,
+            "private",
+            "harbor",
+            "",
+        ));
+        b.vault.put(&bad_id, "wrong");
+        b.catalog = crate::build_catalog(&b.sources, &[], &[]);
+        let bad_name = store_name(&b, &bad_id);
+        browse(&mut b, &bad_name, "", Duration::from_secs(15));
+        assert!(
+            b.browse_error
+                .as_deref()
+                .is_some_and(|e| e.contains("authentication failed")),
+            "expected an auth failure class, got {:?}",
+            b.browse_error
+        );
+        assert!(b.catalog.files.is_empty());
+        assert!(b.page.is_none());
+    }
 }

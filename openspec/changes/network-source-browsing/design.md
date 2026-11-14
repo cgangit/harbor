@@ -43,7 +43,7 @@ Spike crate at `/tmp/opencode/smb-spike` (`smb2` 0.43 with `--no-default-feature
 - **Wrong password:** `Error: Protocol { status: NtStatus(STATUS_LOGON_FAILURE), command: SessionSetup }` — classified, not silent.
 - **Missing share:** `Error: Protocol { status: NtStatus(STATUS_BAD_NETWORK_NAME), command: TreeConnect }` — feeds `classify_nt_status`.
 - **Positional reads:** `FileReader::read_at(offset, len)` returns independent offsets (the seek primitive `MediaHandle` needs).
-- **ARM:** `cargo check --target armv7-unknown-linux-gnueabi` finishes clean (rust-std for armv7 installed; the whole tree is pure Rust — no C toolchain, no `dlopen`). Full ARM *link* verification rides the normal CI IPK build once the dependency lands in `harbor-sources` (task 3.2 push).
+- **ARM:** `cargo check --target armv7-unknown-linux-gnueabi` finishes clean (rust-std for armv7 installed; the whole tree is pure Rust — no C toolchain, no `dlopen`). Full ARM *link* verification is done: the `build ARM IPK` CI run for `d5897bf` — the commit that added `smb2` to `harbor-sources` — succeeded on `ubuntu-24.04-arm`, so the crate links into the real IPK.
 
 *Why not `libsmb2` FFI:* it would need a cross C toolchain this host does not have, a static-link seam mirroring `src/starfish.c`, and adds C runtime surface to the jail — for a crate that already passes every criterion. Fallback stays on the shelf only if device runs later reject the crate's dialect/auth against a real NAS.
 

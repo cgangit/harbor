@@ -230,6 +230,58 @@ Log every load / playing / seek / error line to `$XDG_RUNTIME_DIR/harbor/events.
 - Key mapping: scancode and keycode paths agree; left click → `Key::Ok`; event-type allowlist accepts SDL2 and drops foreign types.
 - Catalog: `refresh_catalog` over in-memory stores, `build_catalog` over a fixture mount (subfolder videos included), empty degradation; adding a source marks the refresh and the next Home draw shows it.
 
+### LAN checklist (optional, change `network-source-browsing`)
+
+Real-network verification against fixture servers on this machine (needs `podman` and `ffmpeg`; run from the repo root). The recipes in `ci/fixtures/` are context-free images: a Samba with a guest share and an NTLMv2 share (`harbor`/`harborpass`), and MiniDLNA serving generated clips.
+
+```bash
+# Fixture server images.
+podman build -f ci/fixtures/samba.Containerfile -t harbor-samba-test ci/fixtures
+podman build -f ci/fixtures/minidlna.Containerfile -t harbor-minidlna-test ci/fixtures
+
+# Tiny generated media for MiniDLNA (host ffmpeg).
+mkdir -p /tmp/harbor-lan/media/Movies
+ffmpeg -y -loglevel error -f lavfi -i testsrc=duration=2:size=320x240:rate=10 \
+  -f lavfi -i sine=frequency=440:duration=2 -c:v libx264 -pix_fmt yuv420p -c:a aac \
+  /tmp/harbor-lan/media/harbor-demo.mkv
+ffmpeg -y -loglevel error -f lavfi -i testsrc2=duration=2:size=320x240:rate=10 \
+  -f lavfi -i sine=frequency=880:duration=2 -c:v libx264 -pix_fmt yuv420p -c:a aac \
+  /tmp/harbor-lan/media/coastline.mp4
+ffmpeg -y -loglevel error -f lavfi -i smptebars=duration=2:size=320x240:rate=10 \
+  -f lavfi -i sine=frequency=220:duration=2 -c:v libx264 -pix_fmt yuv420p -c:a aac \
+  /tmp/harbor-lan/media/Movies/episode-one.mkv
+
+# MiniDLNA on the host network (SSDP replies carry host addresses).
+podman rm -f harbor-minidlna
+podman run -d --name harbor-minidlna --network host \
+  -v /tmp/harbor-lan/media:/media:ro harbor-minidlna-test
+
+# Samba on 127.0.0.1:1445 (guest share + authenticated share).
+podman rm -f harbor-samba
+podman run -d --name harbor-samba -p 1445:445 harbor-samba-test
+
+# Wait for both fixtures to accept connections (they start asynchronously;
+# bash-only /dev/tcp probes, bounded at 10 s each).
+for _ in $(seq 50); do (echo > /dev/tcp/127.0.0.1/8200) 2>/dev/null && break; sleep 0.2; done
+for _ in $(seq 50); do (echo > /dev/tcp/127.0.0.1/1445) 2>/dev/null && break; sleep 0.2; done
+
+# The checklist itself, through the app's async browse path (design D3/D4).
+HARBOR_SMB_LIVE=1 cargo test -p harbor-sources live_smb
+HARBOR_LAN_LIVE=1 HARBOR_DLN_NAME="Harbor Test DLNA" cargo test -p harbor-screens lan_live
+
+# Cleanup when done.
+podman rm -f harbor-minidlna harbor-samba
+```
+
+Overrides: `HARBOR_SMB_ADDR=host:port` (non-default Samba), `HARBOR_DLN_LOCATION=<url>` (describe a known device description instead of SSDP), `HARBOR_DLN_NAME=<friendly name>` (pin a specific server — a real LAN may answer M-SEARCH first).
+
+**Results, recorded 2026-11-14** (x86_64 dev host, LAN `192.168.2.0/24`, both fixtures from the commands above):
+
+- `live_smb` — **ok, 0.08 s**: guest share lists (`.`/`..` filtered), the second listing is served from the cache, `Movies/episode.mkv` readdirs over the wire, `harbor`/`harborpass` opens the `private` share (NTLMv2), a wrong password arrives as an `Auth` failure class, a missing share as `NotFound`.
+- `lan_live` — **ok, 1.33 s**: live SSDP discovery found `Harbor Test DLNA` (another MediaServer on the LAN answered M-SEARCH first, which is what `HARBOR_DLN_NAME` pins), the root listed through the `Browse Folders` drill-down down to `.mkv`/`.mp4` resource URLs; the guest share listed `movie.mkv`, the authenticated share listed `private-movie.mkv`, and the wrong-password case arrived as the auth failure class with no page left behind — all through `network_source` → `start` → `drain`, never blocking the caller.
+
+The command block above was executed verbatim on 2026-11-14 (exit 0, both tests green) — the readiness waits are what make the first `live_smb` run deterministic, since `smbd` accepts connections a moment after `podman run` returns.
+
 ### Simulator (`make sim`)
 
 - UI smoke at 1920x1080 under Xvfb.
