@@ -35,6 +35,18 @@ See proposal.md for motivation. Facts that shape this design:
 **D2 — SMB client by spike, with a fallback already chosen.**
 Task 1 runs a time-boxed spike: (a) a pure-Rust SMB2 crate that supports NTLMv2 auth **and** positional reads (`read_at` is required by the seek path), (b) `libsmb2` C FFI, which the original design named. Selection criteria: passes against a local Samba with and without a password, cross-compiles to `armv7-unknown-linux-gnueabi` with the webOS NDK, and no runtime outside the app jail. If the crate fails any criterion, `libsmb2` is the fallback and the FFI seam mirrors `src/starfish.c` (thin C, `dlopen`-free static link). *Risk note:* whichever wins, `SmbSource::new` must gain a real "connect + readdir" path while keeping its fixture constructors for tests.
 
+**D2 verdict (task 3.1, 2026-11-14): pure-Rust `smb2` 0.43.0 wins; `libsmb2` FFI not needed.**
+Spike crate at `/tmp/opencode/smb-spike` (`smb2` 0.43 with `--no-default-features --features smol,testing`, driven by `futures_lite::future::block_on`), against a real Samba 4 in a local container (`harbor-samba-test`, guest share + NTLMv2 user `harbor`, port 1445):
+
+- **No password (guest):** `connect OK` → `tree connect OK share=guest` → `list_directory OK 4 entries` → `read_at OK file="big.txt" head=16 mid=16 (independent offsets)` → `SPIKE PASS`.
+- **With password (NTLMv2):** `list_directory OK 3 entries` on the `private` share (visible only to `harbor`) → `SPIKE PASS`.
+- **Wrong password:** `Error: Protocol { status: NtStatus(STATUS_LOGON_FAILURE), command: SessionSetup }` — classified, not silent.
+- **Missing share:** `Error: Protocol { status: NtStatus(STATUS_BAD_NETWORK_NAME), command: TreeConnect }` — feeds `classify_nt_status`.
+- **Positional reads:** `FileReader::read_at(offset, len)` returns independent offsets (the seek primitive `MediaHandle` needs).
+- **ARM:** `cargo check --target armv7-unknown-linux-gnueabi` finishes clean (rust-std for armv7 installed; the whole tree is pure Rust — no C toolchain, no `dlopen`). Full ARM *link* verification rides the normal CI IPK build once the dependency lands in `harbor-sources` (task 3.2 push).
+
+*Why not `libsmb2` FFI:* it would need a cross C toolchain this host does not have, a static-link seam mirroring `src/starfish.c`, and adds C runtime surface to the jail — for a crate that already passes every criterion. Fallback stays on the shelf only if device runs later reject the crate's dialect/auth against a real NAS.
+
 **D3 — Browse queue: `Arc<Mutex<Vec<BrowseResult>>>` drained once per frame.**
 A worker thread holds a clone of the queue plus the source handle and posts the first `Page` (or an error class); the app loop drains it every frame into `View` (clearing `loading`, setting `catalog.files`). Chosen over `mpsc::Receiver` inside `View` because `View` derives `Clone + Debug + PartialEq + Eq` and a `Receiver` is none of those; a shared `Vec` keeps every derive intact and is trivially testable without threads. *Alternative considered:* `crossbeam` channel — rejected for the same derive problem plus a dependency.
 

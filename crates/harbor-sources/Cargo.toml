@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 harbor-base.workspace = true
 harbor-platform.workspace = true
+smb2.workspace = true
+futures-lite.workspace = true

@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use smb2::{ClientConfig, DirectoryEntry, Error as Smb2Error, ErrorKind as Smb2Kind, SmbClient};
 
 use crate::entry::{ext_of, is_video_name, Entry, EntryKind, Page, Probe};
 use crate::error::SourceError;
@@ -26,14 +29,36 @@ pub struct SmbDirent {
     pub mtime: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SmbSource {
     pub id: SourceId,
     pub name: String,
     pub creds: SmbCreds,
-    dirs: BTreeMap<String, Vec<SmbDirent>>,
+    /// `path` → dirents. Fixture constructors fill it up front; a networked
+    /// source fills it from `list` results. A mutex (not a plain map) because
+    /// `Source::list` takes `&self` and browse workers list from another
+    /// thread (design D3, same reason as `DlnaSource::pages`).
+    dirs: Mutex<BTreeMap<String, Vec<SmbDirent>>>,
     files: BTreeMap<String, Vec<u8>>,
     fail: Option<SourceError>,
+    /// Set only by [`SmbSource::networked`]: `list` then connects over SMB2
+    /// instead of reading the in-memory fixture maps (task 3.2).
+    network: bool,
+}
+
+impl Clone for SmbSource {
+    fn clone(&self) -> Self {
+        let dirs = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            creds: self.creds.clone(),
+            dirs: Mutex::new(dirs.clone()),
+            files: self.files.clone(),
+            fail: self.fail.clone(),
+            network: self.network,
+        }
+    }
 }
 
 impl SmbCreds {
@@ -62,10 +87,22 @@ impl SmbSource {
             id: SourceId(id),
             name,
             creds,
-            dirs,
+            dirs: Mutex::new(dirs),
             files: BTreeMap::new(),
             fail: None,
+            network: false,
         }
+    }
+
+    /// A live SMB source (task 3.2): `list` connects to the server and
+    /// readdirs over SMB2, caching each listing in `dirs`. The empty root
+    /// entry `new` seeds for fixtures is dropped so the first root listing
+    /// is a cache miss, not a cached empty page.
+    pub fn networked(creds: SmbCreds) -> Self {
+        let mut src = Self::new(creds);
+        src.dirs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        src.network = true;
+        src
     }
 
     pub fn fixture(creds: SmbCreds) -> Self {
@@ -97,13 +134,14 @@ impl SmbSource {
     pub fn add_dir(&mut self, parent: &str, name: &str) {
         let parent = canonical_path(parent).unwrap_or_default();
         let child = join_path(&parent, name);
-        self.dirs.entry(parent.clone()).or_default().push(SmbDirent {
+        let mut dirs = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
+        dirs.entry(parent.clone()).or_default().push(SmbDirent {
             name: name.to_string(),
             kind: EntryKind::Dir,
             size: None,
             mtime: None,
         });
-        self.dirs.entry(child).or_default();
+        dirs.entry(child).or_default();
     }
 
     pub fn add_file(&mut self, parent: &str, name: &str, data: &[u8]) {
@@ -114,12 +152,14 @@ impl SmbSource {
         } else {
             EntryKind::Other
         };
-        self.dirs.entry(parent).or_default().push(SmbDirent {
+        let mut dirs = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
+        dirs.entry(parent).or_default().push(SmbDirent {
             name: name.to_string(),
             kind,
             size: Some(data.len() as u64),
             mtime: None,
         });
+        drop(dirs);
         self.files.insert(child, data.to_vec());
     }
 
@@ -129,6 +169,174 @@ impl SmbSource {
             None => Ok(()),
         }
     }
+
+    /// The `ClientConfig` for this source's credentials (task 3.2). The
+    /// form's host may omit the port; SMB lives on 445 (tests pass an
+    /// explicit `host:port`).
+    fn client_config(&self) -> ClientConfig {
+        ClientConfig {
+            addr: smb_addr(&self.creds.host),
+            username: self.creds.username.clone(),
+            password: self.creds.password.clone(),
+            domain: self.creds.domain.clone(),
+            timeout: CONNECT_TIMEOUT,
+            ..ClientConfig::default()
+        }
+    }
+
+    /// Connect, tree-connect, and readdir one path over SMB2, caching the
+    /// result for the next `list` (task 3.2). Runs on the caller's thread —
+    /// the browse queue (group 4) is what keeps it off the present loop.
+    fn readdir(&self, path: &str) -> Result<Vec<SmbDirent>, SourceError> {
+        let started = Instant::now();
+        let found = futures_lite::future::block_on(async {
+            let mut client = SmbClient::connect(self.client_config())
+                .await
+                .map_err(|e| self.classify_smb(&e, path, started.elapsed()))?;
+            let mut tree = client
+                .connect_share(&self.creds.share)
+                .await
+                .map_err(|e| self.classify_smb(&e, path, started.elapsed()))?;
+            client
+                .list_directory(&mut tree, path)
+                .await
+                .map_err(|e| self.classify_smb(&e, path, started.elapsed()))
+        })?;
+        let dirents: Vec<SmbDirent> = found.iter().map(dirent_of).collect();
+        self.dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_string(), dirents.clone());
+        Ok(dirents)
+    }
+
+    /// Route an `smb2::Error` through the existing classifiers (task 3.2)
+    /// by extracting its primitive signals first — the crate's `Error` is
+    /// `#[non_exhaustive]` and cannot be built in tests, so the routing
+    /// rules live in [`classify_smb_failure`].
+    fn classify_smb(&self, err: &Smb2Error, path: &str, elapsed: Duration) -> SourceError {
+        let timed_out = match err {
+            Smb2Error::Io(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            other => other.kind() == Smb2Kind::TimedOut,
+        };
+        let auth = matches!(
+            err.kind(),
+            Smb2Kind::AuthRequired | Smb2Kind::AccessDenied | Smb2Kind::GuestSessionRefused
+        );
+        classify_smb_failure(
+            err.status().map(|s| s.0),
+            timed_out,
+            auth,
+            err.to_string(),
+            path,
+            elapsed,
+            &self.id.0,
+        )
+    }
+}
+
+/// The routing rules for one SMB failure (task 3.2), as primitives so they
+/// are unit-testable: NTSTATUS first (`classify_nt_status`), then the
+/// connect budget (`classify_connect`), then the auth flag, and finally the
+/// crate's own message.
+fn classify_smb_failure(
+    status: Option<u32>,
+    timed_out: bool,
+    auth: bool,
+    message: String,
+    path: &str,
+    elapsed: Duration,
+    source: &str,
+) -> SourceError {
+    if let Some(code) = status {
+        if let Some(mapped) = classify_nt_status(code) {
+            return mapped;
+        }
+        // STATUS_OBJECT_NAME_NOT_FOUND / STATUS_OBJECT_PATH_NOT_FOUND /
+        // STATUS_BAD_NETWORK_NAME: the path or share simply isn't there.
+        if matches!(code, 0xC000_0034 | 0xC000_003A | 0xC000_00CC) {
+            return SourceError::NotFound {
+                path: path.to_string(),
+            };
+        }
+    }
+    if let Some(mapped) = classify_connect(elapsed, CONNECT_TIMEOUT, timed_out) {
+        return mapped;
+    }
+    if auth {
+        return SourceError::Auth {
+            source: source.to_string(),
+        };
+    }
+    SourceError::Io(message)
+}
+
+/// `host` from the Add form may omit the port; SMB's default is 445. An
+/// explicit `host:port` (tests, non-standard ports) passes through.
+fn smb_addr(host: &str) -> String {
+    let has_port = host.rsplit_once(':').is_some_and(|(_, port)| {
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+    });
+    if has_port {
+        host.to_string()
+    } else {
+        format!("{host}:445")
+    }
+}
+
+/// One server dirent → the in-memory shape both listing paths share.
+fn dirent_of(e: &DirectoryEntry) -> SmbDirent {
+    let kind = if e.is_directory {
+        EntryKind::Dir
+    } else if is_video_name(&e.name) {
+        EntryKind::Video
+    } else {
+        EntryKind::Other
+    };
+    SmbDirent {
+        name: e.name.clone(),
+        kind,
+        size: (!e.is_directory).then_some(e.size),
+        mtime: if e.is_directory {
+            None
+        } else {
+            e.modified
+                .to_system_time()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        },
+    }
+}
+
+/// Dirents → the `Page` both listing paths return: dot entries and
+/// non-media (`EntryKind::Other`) skipped, dirs first, then name order.
+fn page_from(path: &str, dirents: &[SmbDirent]) -> Page {
+    let mut entries = Vec::new();
+    for d in dirents {
+        if d.kind == EntryKind::Other || d.name == "." || d.name == ".." {
+            continue;
+        }
+        entries.push(Entry {
+            id: join_path(path, &d.name),
+            parent: path.to_string(),
+            name: d.name.clone(),
+            kind: d.kind,
+            size: d.size,
+            mtime: d.mtime,
+            url: None,
+        });
+    }
+    entries.sort_by(|a, b| match (a.kind, b.kind) {
+        (EntryKind::Dir, EntryKind::Dir) | (EntryKind::Video, EntryKind::Video) => {
+            a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
+        }
+        (EntryKind::Dir, _) => std::cmp::Ordering::Less,
+        _ => std::cmp::Ordering::Greater,
+    });
+    Page { entries }
 }
 
 impl Source for SmbSource {
@@ -147,33 +355,31 @@ impl Source for SmbSource {
     fn list(&self, path: &str) -> Result<Page, SourceError> {
         self.check()?;
         let path = canonical_path(path)?;
-        let dirents = self.dirs.get(&path).ok_or_else(|| SourceError::NotFound {
-            path: path.clone(),
-        })?;
-        let mut entries = Vec::new();
-        for d in dirents {
-            if d.kind == EntryKind::Other {
-                continue;
-            }
-            let id = join_path(&path, &d.name);
-            entries.push(Entry {
-                id,
-                parent: path.clone(),
-                name: d.name.clone(),
-                kind: d.kind,
-                size: d.size,
-                mtime: d.mtime,
-                url: None,
-            });
+        if self.network {
+            // Cache first (a repeat or back-navigation is offline), then the
+            // network path: connect + readdir, errors classified (task 3.2).
+            let cached = self
+                .dirs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&path)
+                .cloned();
+            let dirents = match cached {
+                Some(dirents) => dirents,
+                None => self.readdir(&path)?,
+            };
+            return Ok(page_from(&path, &dirents));
         }
-        entries.sort_by(|a, b| match (a.kind, b.kind) {
-            (EntryKind::Dir, EntryKind::Dir) | (EntryKind::Video, EntryKind::Video) => {
-                a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
-            }
-            (EntryKind::Dir, _) => std::cmp::Ordering::Less,
-            _ => std::cmp::Ordering::Greater,
-        });
-        Ok(Page { entries })
+        let dirents = self
+            .dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&path)
+            .cloned()
+            .ok_or_else(|| SourceError::NotFound {
+                path: path.clone(),
+            })?;
+        Ok(page_from(&path, &dirents))
     }
 
     fn open(&self, entry: &Entry) -> Result<MediaHandle, SourceError> {
@@ -365,5 +571,169 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(classify_connect(Duration::from_secs(1), CONNECT_TIMEOUT, false).is_none());
+    }
+
+    /// The routing rules of task 3.2: NTSTATUS through `classify_nt_status`,
+    /// the budget through `classify_connect`, auth next, message last.
+    /// (`smb2::Error` is `#[non_exhaustive]`, so the rules take primitives.)
+    #[test]
+    fn classify_smb_failure_routes_status_budget_and_auth() {
+        let elapsed = Duration::from_millis(3);
+        // STATUS_LOGON_FAILURE → the existing NT-status classifier.
+        let auth = classify_smb_failure(
+            Some(0xC000_006D),
+            false,
+            false,
+            "login".into(),
+            "",
+            elapsed,
+            "smb:nas/media",
+        );
+        match auth {
+            SourceError::Auth { source } => assert_eq!(source, "smb"),
+            other => panic!("{other:?}"),
+        }
+        // STATUS_BAD_NETWORK_NAME → missing share, not a transport failure.
+        let gone = classify_smb_failure(
+            Some(0xC000_00CC),
+            false,
+            false,
+            "tree".into(),
+            "share",
+            elapsed,
+            "smb",
+        );
+        match gone {
+            SourceError::NotFound { path } => assert_eq!(path, "share"),
+            other => panic!("{other:?}"),
+        }
+        // Timed out inside the 10 s budget → the existing connect classifier.
+        let slow = classify_smb_failure(
+            None,
+            true,
+            false,
+            "slow".into(),
+            "",
+            elapsed,
+            "smb",
+        );
+        match slow {
+            SourceError::Timeout { what } => assert_eq!(what, "SMB connect"),
+            other => panic!("{other:?}"),
+        }
+        // Guest/permission refusals without a mapped status → Auth.
+        let refused = classify_smb_failure(
+            None,
+            false,
+            true,
+            "refused".into(),
+            "",
+            elapsed,
+            "smb:nas/media",
+        );
+        match refused {
+            SourceError::Auth { source } => assert_eq!(source, "smb:nas/media"),
+            other => panic!("{other:?}"),
+        }
+        // Anything else keeps the crate's message.
+        match classify_smb_failure(None, false, false, "boom".into(), "", elapsed, "smb") {
+            SourceError::Io(msg) => assert_eq!(msg, "boom"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn smb_addr_defaults_port_and_keeps_explicit() {
+        assert_eq!(smb_addr("nas"), "nas:445");
+        assert_eq!(smb_addr("nas.local"), "nas.local:445");
+        assert_eq!(smb_addr("127.0.0.1:1445"), "127.0.0.1:1445");
+        assert_eq!(smb_addr("192.168.1.9:1"), "192.168.1.9:1");
+    }
+
+    /// The network path exists (task 3.2): a dead port surfaces a classified
+    /// error — a fixture would answer `NotFound` from the empty map without
+    /// dialing anything.
+    #[test]
+    fn networked_list_dials_and_classifies_dead_host() {
+        let src = SmbSource::networked(SmbCreds::new("127.0.0.1:1", "share", "u", "", "p"));
+        match src.list("") {
+            Err(SourceError::Io(_)) => {}
+            other => panic!("expected classified Io from a dead host, got {other:?}"),
+        }
+    }
+
+    /// Cached listings are served without dialing (the dead host would
+    /// error); only a cache miss takes the network path.
+    #[test]
+    fn networked_cache_serves_without_network() {
+        let mut src = SmbSource::networked(SmbCreds::new("127.0.0.1:1", "share", "u", "", "p"));
+        src.add_dir("", "Movies");
+        let page = src.list("").unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].name, "Movies");
+        // Cache miss on an uncached path dials the (dead) server.
+        match src.list("Elsewhere") {
+            Err(SourceError::Io(_)) => {}
+            other => panic!("expected Io on a cache miss, got {other:?}"),
+        }
+    }
+
+    /// Opt-in against a local Samba (task 3.2): `HARBOR_SMB_LIVE=1`, with
+    /// `HARBOR_SMB_ADDR=host:port` if it is not on `127.0.0.1:1445`.
+    /// Covers guest readdir, NTLMv2 with a password, wrong-password
+    /// classification, and a missing share — the spike criteria end to end.
+    #[test]
+    fn live_smb_connect_readdir_and_cache() {
+        if std::env::var("HARBOR_SMB_LIVE").as_deref() != Ok("1") {
+            return;
+        }
+        let addr = std::env::var("HARBOR_SMB_ADDR").unwrap_or_else(|_| "127.0.0.1:1445".into());
+
+        // Guest (no password): the share lists, dot entries are filtered.
+        let guest = SmbSource::networked(SmbCreds::new(&addr, "guest", "", "", ""));
+        let page = guest.list("").unwrap();
+        let names: Vec<_> = page.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"movie.mkv"), "{names:?}");
+        assert!(page.entries.iter().all(|e| e.name != "." && e.name != ".."));
+        // Second listing comes from the cache.
+        assert_eq!(guest.list("").unwrap(), page);
+        // A subdirectory readdirs over the wire.
+        let movies = guest.list("Movies").unwrap();
+        assert!(
+            movies.entries.iter().any(|e| e.name == "episode.mkv"),
+            "{movies:?}"
+        );
+
+        // NTLMv2 with a password: the private share opens for `harbor`.
+        let ok = SmbSource::networked(SmbCreds::new(
+            &addr,
+            "private",
+            "harbor",
+            "",
+            "harborpass",
+        ));
+        let priv_page = ok.list("").unwrap();
+        assert!(
+            priv_page.entries.iter().any(|e| e.name == "private-movie.mkv"),
+            "{priv_page:?}"
+        );
+        // Wrong password → STATUS_LOGON_FAILURE routed to Auth.
+        let bad = SmbSource::networked(SmbCreds::new(&addr, "private", "harbor", "", "wrong"));
+        match bad.list("") {
+            Err(SourceError::Auth { source }) => assert_eq!(source, "smb"),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+        // Missing share → STATUS_BAD_NETWORK_NAME routed to NotFound.
+        let nosuch = SmbSource::networked(SmbCreds::new(
+            &addr,
+            "no-such-share",
+            "harbor",
+            "",
+            "harborpass",
+        ));
+        match nosuch.list("") {
+            Err(SourceError::NotFound { path }) => assert_eq!(path, ""),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }
