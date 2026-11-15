@@ -18,7 +18,7 @@
 ## 4. Integration and verification
 
 - [x] 4.1 Run `make check` (workspace tests + `ci/test_mkipk.py`) and keep it green — the gate for every group above. (exit 0; 21 × `test result: ok`, 0 failures, 0 warnings — includes the new rasterizer/cache/coverage tests; re-ran after fixing the last `unused_mut` in the coverage test)
-- [ ] 4.2 Push and confirm the `build ARM IPK` CI run succeeds with `fontdue` and the embedded font, with the IPK growing by roughly the subset size rather than megabytes (verify from the run's artifact size).
+- [x] 4.2 Push and confirm the `build ARM IPK` CI run succeeds with `fontdue` and the embedded font, with the IPK growing by roughly the subset size rather than megabytes (verify from the run's artifact size). (push `4bc21ab`, run `43664169953` **completed/success**; artifact `harbor-ipk` **1,049,053 B** vs `515b5cc`'s 941,656 B → **+107,397 B (~105 KB)**: the 36,356 B subset plus ~70 KB of fontdue/ttf-parser/libm code — KB-scale, not MB-scale)
 
 ## Workflow follow-up
 
