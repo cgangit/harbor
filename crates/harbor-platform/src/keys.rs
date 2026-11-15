@@ -25,7 +25,11 @@ pub fn from_sdl_scancode(scancode: i32) -> Key {
         82 => Key::Up,
         81 => Key::Down,
         40 | 44 => Key::Ok,
-        41 | 42 => Key::Back,
+        // 41 = ESCAPE; 42 = LCTRL (seen as Back on a gamepad-style remote);
+        // 270 = SDL_SCANCODE_AC_BACK (the webOS remote's Back is plausibly
+        // delivered in this shape — keycode-only devices send the unmasked
+        // number, and 270 means Back under either reading).
+        41 | 42 | 270 => Key::Back,
         19 => Key::Play,
         48 => Key::Pause,
         22 => Key::Stop,
@@ -87,6 +91,8 @@ mod tests {
     fn enter_and_escape() {
         assert_eq!(from_sdl_scancode(40), Key::Ok);
         assert_eq!(from_sdl_scancode(41), Key::Back);
+        // AC_BACK in raw-number shape (webOS keycode-only devices send this)
+        assert_eq!(from_sdl_scancode(270), Key::Back);
     }
 
     #[test]

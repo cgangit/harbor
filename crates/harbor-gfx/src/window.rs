@@ -435,6 +435,7 @@ mod tests {
         assert_eq!(key_from_event(None, Some(40)), Some(Key::Ok));
         // plausible Back codes (ESCAPE scancode, or AC_BACK's 270)
         assert_eq!(key_from_event(None, Some(41)), Some(Key::Back));
+        assert_eq!(key_from_event(None, Some(270)), Some(Key::Back));
         // masked SDLK_* input still resolves canonically first
         assert_eq!(key_from_event(None, Some(82 | MASK)), Some(Key::Up));
     }
