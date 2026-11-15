@@ -22,12 +22,24 @@ impl StarfishSink {
     pub fn try_create(&mut self) -> Result<(), String> {
         let rc = unsafe { crate::ffi::sf_create() };
         if rc != 0 {
+            harbor_base::log("media: sink unavailable (dlopen libplayerAPIs/libAcb failed)");
             return Err("native-video-unavailable".into());
         }
         let _ = unsafe { crate::ffi::acb_create() };
+        harbor_base::log("media: sink created");
         self.created = true;
         Ok(())
     }
+}
+
+/// One line of a load payload for the log (URLs and option JSON stay under
+/// ~160 chars so the log stays scannable).
+fn brief(payload: &str) -> String {
+    let mut out: String = payload.chars().take(160).collect();
+    if payload.chars().count() > 160 {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -66,8 +78,10 @@ impl VideoSink for StarfishSink {
         let c = std::ffi::CString::new(payload).map_err(|e| e.to_string())?;
         let rc = unsafe { crate::ffi::sf_load(c.as_ptr()) };
         if rc != 0 {
+            harbor_base::log(&format!("media: load failed rc={rc} payload={}", brief(payload)));
             Err("load failed".into())
         } else {
+            harbor_base::log(&format!("media: load ok payload={}", brief(payload)));
             Ok(())
         }
     }

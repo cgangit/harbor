@@ -32,6 +32,22 @@ static void *first_sym(void *lib, const char *const *names)
     return NULL;
 }
 
+/* webOS TV ships only SONAME'd libraries (libplayerAPIs.so.1, libAcb.so.1)
+ * without the development .so symlinks, so try the plain name first (OSE and
+ * dev images) and fall back through the versioned ones (verified present on
+ * the target: /usr/lib/libplayerAPIs.so.1, /usr/lib/libAcb.so.1). */
+static void *open_lib(const char *const *names)
+{
+    size_t i;
+    for (i = 0; names[i] != NULL; i++) {
+        void *h = dlopen(names[i], RTLD_NOW);
+        if (h != NULL) {
+            return h;
+        }
+    }
+    return NULL;
+}
+
 int sf_create(void)
 {
     static const char *feed_names[] = {
@@ -40,10 +56,16 @@ int sf_create(void)
         "Feed",
         NULL
     };
+    static const char *player_names[] = {
+        "libplayerAPIs.so",
+        "libplayerAPIs.so.1",
+        "libplayerAPIs.so.1.0.0",
+        NULL
+    };
     if (g_player != NULL) {
         return 0;
     }
-    g_player = dlopen("libplayerAPIs.so", RTLD_NOW);
+    g_player = open_lib(player_names);
     if (g_player == NULL) {
         return -1;
     }
@@ -128,10 +150,16 @@ void sf_destroy(void)
 
 int acb_create(void)
 {
+    static const char *acb_names[] = {
+        "libAcb.so",
+        "libAcb.so.1",
+        "libAcb.so.1.0.0",
+        NULL
+    };
     if (g_acb != NULL) {
         return 0;
     }
-    g_acb = dlopen("libAcb.so", RTLD_NOW);
+    g_acb = open_lib(acb_names);
     if (g_acb == NULL) {
         return -1;
     }

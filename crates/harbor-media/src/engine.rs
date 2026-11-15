@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -10,6 +10,11 @@ use harbor_sources::Probe;
 use crate::au::AccessUnit;
 use crate::demux;
 use crate::shared::Shared;
+
+/// Caps the feed-error log at five lines: a broken pipeline would otherwise
+/// write one per pump tick (~60/s) and bury the log. Global because the
+/// diagnostic cap is per process, not per engine instance.
+static FEED_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +76,7 @@ impl<S: VideoSink> Engine<S> {
             (VideoPlane::Exported, Some(id)) => harbor_platform::inject_window_id(payload, id),
             _ => payload.to_string(),
         };
+        harbor_base::log(&format!("media: engine load plane={:?}", self.sink.plane()));
         self.sink.load(&payload)?;
         self.shared.load_completed.store(false, Ordering::Release);
         self.shared.stop.store(false, Ordering::Release);
@@ -96,6 +102,7 @@ impl<S: VideoSink> Engine<S> {
                         || self.shared.load_completed.load(Ordering::Acquire))
                 {
                     self.sink.play();
+                    harbor_base::log("media: playing (exported plane)");
                     self.stage = Stage::Playing;
                 }
             }
@@ -113,6 +120,7 @@ impl<S: VideoSink> Engine<S> {
                 .clone();
             if !id.is_empty() {
                 self.sink.acb_bind(&id);
+                harbor_base::log(&format!("media: acb bind id={id}"));
                 self.stage = Stage::Bound;
             }
         }
@@ -126,6 +134,10 @@ impl<S: VideoSink> Engine<S> {
             if !info.is_empty() {
                 self.sink.acb_send_video_data(&info);
                 self.sink.acb_start(0, 0, SCR_W as i32, SCR_H as i32);
+                harbor_base::log(&format!(
+                    "media: acb display window 0,0,{},{} -> playing",
+                    SCR_W, SCR_H
+                ));
                 self.sink.play();
                 self.stage = Stage::Playing;
             }
@@ -190,6 +202,14 @@ impl<S: VideoSink> Engine<S> {
                 self.pending = Some(au);
             }
             FeedResult::Error => {
+                let n = FEED_ERRORS.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    harbor_base::log(&format!(
+                        "media: feed error #{} (stage {:?} -> Idle)",
+                        n + 1,
+                        self.stage
+                    ));
+                }
                 self.stage = Stage::Idle;
             }
         }

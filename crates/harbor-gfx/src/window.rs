@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use sdl2::event::Event;
+use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Scancode;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::Color as SdlColor;
@@ -78,14 +78,18 @@ impl<K: Eq + Hash, V> BoundedCache<K, V> {
     }
 }
 
-/// Logs the first [`RawEventLog::LIMIT`] key/button events — plus a short
-/// [`RawEventLog::MOTION_LIMIT`] tail of pointer motion — to the app log so
-/// that codes reported by an unverified device (webOS remote keycodes, Magic
-/// Remote pointer events) are visible without a debugger.
+/// Logs raw input events to the app log so that codes reported by an
+/// unverified device (webOS remote keycodes, Magic Remote pointer events,
+/// event shapes we do not consume — the Back-key diagnosis needed exactly
+/// that) are visible without a debugger. Three budgets by class: key/button
+/// events share the main one, pointer motion has its own small one (an air
+/// mouse floods the queue), and unhandled shapes (`window` / `other`) share
+/// a third so a diagnostic line can never crowd out a key code.
 #[derive(Default)]
 pub struct RawEventLog {
     seen: usize,
     motion_seen: usize,
+    other_seen: usize,
 }
 
 impl RawEventLog {
@@ -95,31 +99,45 @@ impl RawEventLog {
     /// the Back press we were waiting to capture), and a handful of
     /// coordinates is enough to prove the pointer maps onto 1920×1080.
     pub const MOTION_LIMIT: usize = 8;
+    /// Unhandled event shapes — window events (filtered to the non-noisy
+    /// kinds), touch/wheel/controller, key repeats — are logged with their
+    /// full `Debug` payload; 12 lines is plenty for one diagnosis run.
+    pub const OTHER_LIMIT: usize = 12;
 
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns the line for this event while under the class's budget,
-    /// `None` after. Motion counts separately so it can never exhaust the
-    /// key/button budget.
-    pub fn record(&mut self, class: &str, codes: &[i64]) -> Option<String> {
-        let (count, limit) = if class == "motion" {
-            (&mut self.motion_seen, Self::MOTION_LIMIT)
-        } else {
-            (&mut self.seen, Self::LIMIT)
-        };
-        if *count >= limit {
-            return None;
+    fn slot(&mut self, class: &str) -> (&mut usize, usize) {
+        match class {
+            "motion" => (&mut self.motion_seen, Self::MOTION_LIMIT),
+            "keydown" | "keyup" | "mousedown" => (&mut self.seen, Self::LIMIT),
+            _ => (&mut self.other_seen, Self::OTHER_LIMIT),
         }
-        *count += 1;
+    }
+
+    /// Returns the line for this event while under the class's budget,
+    /// `None` after. Motion and unhandled shapes count separately so they
+    /// can never exhaust the key/button budget.
+    pub fn record(&mut self, class: &str, codes: &[i64]) -> Option<String> {
         let list = codes
             .iter()
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join(",");
+        self.record_msg(class, &format!("codes=[{list}]"))
+    }
+
+    /// Same budgeting as [`Self::record`] with a caller-formatted detail
+    /// (used for `Debug`-formatted event shapes and window-event names).
+    pub fn record_msg(&mut self, class: &str, detail: &str) -> Option<String> {
+        let (count, limit) = self.slot(class);
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
         Some(format!(
-            "evt {class} codes=[{list}] {count}/{limit}",
+            "evt {class} {detail} {count}/{limit}",
             count = *count
         ))
     }
@@ -305,7 +323,43 @@ impl Window {
                         harbor_base::log(&line);
                     }
                 }
-                _ => {}
+                Event::KeyUp {
+                    scancode, keycode, ..
+                } => {
+                    // Logged, never dispatched: a *pair* of down/up proves a
+                    // key reached us at all (the Back diagnosis), and keyup
+                    // shares the key budget so it cannot crowd keydowns out.
+                    let sc = scancode.map(|s| s as i32);
+                    let kc = keycode.map(|k| k.into_i32());
+                    if let Some(line) = self.raw.record(
+                        "keyup",
+                        &[sc.unwrap_or(-1) as i64, kc.unwrap_or(-1) as i64],
+                    ) {
+                        harbor_base::log(&line);
+                    }
+                }
+                Event::Window { win_event, .. } => {
+                    // Anything decodable that we do not consume: prove which
+                    // shapes the device sends (is Back a CLOSE request?). The
+                    // per-frame noise kinds are skipped so the budget lasts.
+                    if !matches!(
+                        win_event,
+                        WindowEvent::Exposed | WindowEvent::Enter | WindowEvent::Leave
+                    ) {
+                        if let Some(line) =
+                            self.raw.record_msg("window", &format!("{win_event:?}"))
+                        {
+                            harbor_base::log(&line);
+                        }
+                    }
+                }
+                other => {
+                    // Touch, wheel, controller, key repeats, text input, ...
+                    // full Debug is the most direct diagnosis; budgeted.
+                    if let Some(line) = self.raw.record_msg("other", &format!("{other:?}")) {
+                        harbor_base::log(&line);
+                    }
+                }
             }
         }
         (quit, keys)
@@ -507,6 +561,38 @@ mod tests {
                 .unwrap()
                 .contains("mousedown codes=[1,1]")
         );
+    }
+
+    /// Keyup is diagnostic-only but must share the *key* budget: it proves a
+    /// key reached the app (the Back investigation) without ever crowding
+    /// keydown/mousedown lines out of their20.
+    #[test]
+    fn keyup_shares_the_key_budget() {
+        let mut log = RawEventLog::new();
+        let line = log.record("keyup", &[-1, 41]).unwrap();
+        assert!(line.contains("evt keyup codes=[-1,41] 1/20"), "{line}");
+        for _ in 0..RawEventLog::LIMIT - 1 {
+            log.record("keydown", &[-1, 81]).unwrap();
+        }
+        assert_eq!(log.record("keyup", &[-1, 41]), None, "key budget spent");
+        assert_eq!(log.record("mousedown", &[1, 1]), None);
+    }
+
+    /// Unhandled shapes (`window` + `other` classes) share a third budget so
+    /// diagnostic lines can never displace a key code, and motion/keys keep
+    /// their own budgets independently.
+    #[test]
+    fn unhandled_shapes_get_their_own_budget() {
+        let mut log = RawEventLog::new();
+        let line = log.record_msg("window", "Close").unwrap();
+        assert_eq!(line, "evt window Close 1/12");
+        for i in 1..RawEventLog::OTHER_LIMIT {
+            log.record_msg("other", &format!("TouchFingerDown{i}")).unwrap();
+        }
+        assert_eq!(log.record_msg("window", "Close"), None, "budget spent");
+        // keys and motion are unaffected
+        assert!(log.record("keydown", &[-1, 81]).unwrap().contains("1/20"));
+        assert!(log.record("motion", &[1, 2]).unwrap().contains("1/8"));
     }
     #[test]
     fn event_filter_accepts_sdl2_types() {
