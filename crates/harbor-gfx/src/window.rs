@@ -78,36 +78,49 @@ impl<K: Eq + Hash, V> BoundedCache<K, V> {
     }
 }
 
-/// Logs the first [`RawEventLog::LIMIT`] raw input events to the app log so
+/// Logs the first [`RawEventLog::LIMIT`] key/button events — plus a short
+/// [`RawEventLog::MOTION_LIMIT`] tail of pointer motion — to the app log so
 /// that codes reported by an unverified device (webOS remote keycodes, Magic
 /// Remote pointer events) are visible without a debugger.
 #[derive(Default)]
 pub struct RawEventLog {
     seen: usize,
+    motion_seen: usize,
 }
 
 impl RawEventLog {
     pub const LIMIT: usize = 20;
+    /// Pointer motion gets its own small budget: an air mouse floods the
+    /// queue (device log: `20/20` motion lines in one run, which crowded out
+    /// the Back press we were waiting to capture), and a handful of
+    /// coordinates is enough to prove the pointer maps onto 1920×1080.
+    pub const MOTION_LIMIT: usize = 8;
 
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns the line for this event while under the budget, `None` after.
+    /// Returns the line for this event while under the class's budget,
+    /// `None` after. Motion counts separately so it can never exhaust the
+    /// key/button budget.
     pub fn record(&mut self, class: &str, codes: &[i64]) -> Option<String> {
-        if self.seen >= Self::LIMIT {
+        let (count, limit) = if class == "motion" {
+            (&mut self.motion_seen, Self::MOTION_LIMIT)
+        } else {
+            (&mut self.seen, Self::LIMIT)
+        };
+        if *count >= limit {
             return None;
         }
-        self.seen += 1;
+        *count += 1;
         let list = codes
             .iter()
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join(",");
         Some(format!(
-            "evt {class} codes=[{list}] {}/{}",
-            self.seen,
-            Self::LIMIT
+            "evt {class} codes=[{list}] {count}/{limit}",
+            count = *count
         ))
     }
 }
@@ -115,13 +128,34 @@ impl RawEventLog {
 /// Map a `KeyDown` event onto `Key`. Prefers the scancode (host keyboards),
 /// falls back to the keycode — some platforms, notably webOS, deliver only
 /// `keycode`. Returns `None` only when the event carries neither.
+///
+/// **Device fact (webOS 4.x TV, read off `events.log`):** the keycode is the
+/// raw *scancode number*, not an `SDLK_*` value — `codes=[-1,81]` means
+/// scancode absent, keycode `81` = `SDL_SCANCODE_DOWN`, whereas SDL's
+/// contract would be `81 | (1 << 30)`. The third candidate translates
+/// `keycode` through the scancode table, consulted only when no real
+/// scancode was delivered and both canonical readings failed; a host event
+/// that carries a scancode can never reach it, so its ASCII keycodes
+/// (e.g. TAB = 9 = `SDLK_*`… but scancode 9 = `F`) are not misread.
 pub fn key_from_event(scancode: Option<i32>, keycode: Option<i32>) -> Option<Key> {
+    if scancode.is_none() && keycode.is_none() {
+        return None;
+    }
     let from_sc = scancode.map(harbor_platform::from_sdl_scancode);
     let from_kc = keycode.map(harbor_platform::from_sdl_keycode);
-    from_sc
-        .filter(|k| *k != Key::Unknown)
-        .or_else(|| from_kc.filter(|k| *k != Key::Unknown))
-        .or(from_sc.or(from_kc))
+    // webOS shape only: with no scancode present, the raw keycode number may
+    // *be* the scancode (81 → DOWN). A host event always carries a scancode,
+    // so its ASCII keycodes are never reinterpreted through this table.
+    let from_kc_as_sc = keycode
+        .filter(|_| scancode.is_none())
+        .map(harbor_platform::from_sdl_scancode);
+    Some(
+        [from_sc, from_kc, from_kc_as_sc]
+            .into_iter()
+            .flatten()
+            .find(|k| *k != Key::Unknown)
+            .unwrap_or(Key::Unknown),
+    )
 }
 
 /// Map a mouse button press onto `Key`. A left-button click activates the
@@ -387,6 +421,35 @@ mod tests {
         assert_eq!(key_from_event(Some(0), Some(81 | MASK)), Some(Key::Down));
     }
 
+    /// The shape actually observed on the webOS 4.x TV, read off the device
+    /// `events.log` (`evt keydown codes=[-1,81] 1/20`): no scancode, and the
+    /// keycode is the raw *scancode number* — 81 = DOWN, not the SDL
+    /// contract's `81 | (1 << 30)`. Before this fallback every remote key
+    /// decoded to `Unknown` and the UI was stuck on one focus item.
+    #[test]
+    fn webos_raw_scancode_number_keycode_maps() {
+        assert_eq!(key_from_event(None, Some(80)), Some(Key::Left));
+        assert_eq!(key_from_event(None, Some(79)), Some(Key::Right));
+        assert_eq!(key_from_event(None, Some(82)), Some(Key::Up));
+        assert_eq!(key_from_event(None, Some(81)), Some(Key::Down));
+        assert_eq!(key_from_event(None, Some(40)), Some(Key::Ok));
+        // plausible Back codes (ESCAPE scancode, or AC_BACK's 270)
+        assert_eq!(key_from_event(None, Some(41)), Some(Key::Back));
+        // masked SDLK_* input still resolves canonically first
+        assert_eq!(key_from_event(None, Some(82 | MASK)), Some(Key::Up));
+    }
+
+    /// The scancode-number reinterpretation is gated on the scancode field
+    /// being absent: a host event that carries a real scancode keeps its
+    /// ASCII keycode meaning (keycode 9 = TAB must not become FastForward
+    /// via scancode 9 = `F`; keycode 40 = `(` must not become OK).
+    #[test]
+    fn raw_keycode_fallback_never_hijacks_a_real_scancode() {
+        assert_eq!(key_from_event(Some(43), Some(9)), Some(Key::Unknown));
+        assert_eq!(key_from_event(Some(30), Some(40)), Some(Key::Unknown));
+        assert_eq!(key_from_event(Some(80), Some(80 | MASK)), Some(Key::Left));
+    }
+
     #[test]
     fn event_without_any_code_yields_nothing() {
         assert_eq!(key_from_event(None, None), None);
@@ -418,6 +481,32 @@ mod tests {
         assert_eq!(log.record("mousedown", &[1, 1]), None);
     }
 
+    /// Regression from the device log: a Magic Remote's motion events filled
+    /// the shared budget (`20/20` motion lines) and the Back press we needed
+    /// to see was never recorded. Motion now has its own small budget and
+    /// cannot crowd out keys or buttons.
+    #[test]
+    fn motion_budget_cannot_crowd_out_keys() {
+        let mut log = RawEventLog::new();
+        for i in 0..RawEventLog::MOTION_LIMIT {
+            let line = log.record("motion", &[100 + i as i64, 200]).unwrap();
+            assert!(
+                line.contains(&format!("{}/{}", i + 1, RawEventLog::MOTION_LIMIT)),
+                "{line}"
+            );
+        }
+        assert_eq!(log.record("motion", &[9, 9]), None, "motion budget spent");
+        // keys still have their full budget afterwards
+        let line = log.record("keydown", &[-1, 41]).unwrap();
+        assert!(line.contains("keydown"), "{line}");
+        assert!(line.contains("1/20"), "{line}");
+        // buttons too
+        assert!(
+            log.record("mousedown", &[1, 1])
+                .unwrap()
+                .contains("mousedown codes=[1,1]")
+        );
+    }
     #[test]
     fn event_filter_accepts_sdl2_types() {
         for t in [
