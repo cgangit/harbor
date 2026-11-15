@@ -38,3 +38,9 @@ sdl2 = { version = "0.37", default-features = false, features = ["unsafe_texture
 # worker threads, never a tokio runtime.
 smb2 = { version = "0.43", default-features = false, features = ["smol"] }
 futures-lite = "2"
+# Text rasterization (change `text-rendering`, design D1): pure Rust, per-glyph
+# alpha masks. Default features off: they pull in `hashbrown` (fontdue then
+# falls back to `std::collections::HashMap`) and the x86-only `simd` fast path,
+# neither of which we need — `cargo tree -p harbor-gfx` stays free of
+# `hashbrown`/`rayon`, and the rasterizer runs once per (char, px) anyway.
+fontdue = { version = "0.9", default-features = false }

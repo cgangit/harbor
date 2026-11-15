@@ -200,6 +200,33 @@ Matches the race-freedom split in PlxNative's engine-port design, reimplemented:
 - `HARBOR_MEDIA=<dir> HARBOR_SMOKE_FRAMES=3 make smoke` — points discovery at a fixture tree; the boot log must show a non-zero file count.
 - `make sim` — interactive session: arrows / Enter / Escape navigate, a mouse click activates the focused item.
 
+## Text rendering (change `text-rendering`)
+
+Every label draws through `harbor_gfx::text` — glyphs, not placeholder bars.
+
+### Font pipeline
+
+- **Asset:** `crates/harbor-gfx/assets/harbor-font.otf` — Noto Sans SC (OFL, license in `OFL.txt` beside it) subset to the characters the UI draws, embedded with `include_bytes!` so the IPK carries no separate font file and the app consults no system font API.
+- **Regenerate** whenever a string literal the UI draws changes (the i18n dictionary first — `cargo test -p harbor-gfx embedded_subset` fails when the subset falls behind):
+
+  ```bash
+  python3 ci/subset_font.py
+  ```
+
+  Requires `python3 -m pip install --user fonttools`. The script downloads the ~8 MB source font once into `target/font-source/` (gitignored; Range-resume + retries + CDN fallback because raw GitHub resets long transfers), scans every string literal under `crates/`, subsets with `pyftsubset`, then self-checks the cmap (`A`, `中`, `…`, `□`) and a 400 KB budget — currently ~36 KB for 235 characters.
+- **Why `□`:** U+25A1 WHITE SQUARE is the replacement glyph for characters outside the subset; Noto Sans SC has no U+FFFD (verified against the source cmap), so the square is the visible "uncovered" marker.
+
+### Render path
+
+- `Renderer::load` parses the embedded font once (failure → one `events.log` line and placeholder bars, never a panic), keeps a `(char, px)` alpha-mask cache, and `render_to_buffer` composites an RGBA line box; `Frame::draw_text` uploads one texture per `(text, px, colour)` (bounded cache: 512 entries, clear-all) and blits it. The `Surface::text` contract and every `Label` call site are unchanged, so all screens gained text at once.
+- Placement anchors the baseline at 0.88·px with 0.25·px of descender slack — the font's OS/2 typo metrics; its hhea line box reads 1.448 em and would sink labels below the bar they replaced.
+- Fallbacks (never panic): uncovered character → `□`, then a drawn hollow box; texture-upload failure → the old placeholder bar.
+
+### Verification commands
+
+- `cargo test -p harbor-gfx` — rasterizer, placement, cache bounds, and the dictionary-coverage gate.
+- `HARBOR_SMOKE_FRAMES=3 make smoke` — the full draw path under the dummy video driver.
+
 ## Error Handling
 
 | Failure | User-visible | Engine |

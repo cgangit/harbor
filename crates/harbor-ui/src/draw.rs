@@ -30,8 +30,13 @@ impl Surface for Frame<'_> {
     }
 
     fn text(&mut self, x: i32, y: i32, text: &str, px: u16, color: Color) {
-        let w = (text.len() as u32).saturating_mul((px as u32) / 2).max(8);
-        Frame::fill(self, x, y, w, px as u32, color);
+        // Change `text-rendering`: real glyphs through the renderer, with the
+        // pre-rendering placeholder bar kept as the fallback when no text can
+        // be drawn (design D4 - corrupt font, failed texture upload).
+        if !Frame::draw_text(self, x, y, text, px, color) {
+            let w = (text.len() as u32).saturating_mul((px as u32) / 2).max(8);
+            Frame::fill(self, x, y, w, px as u32, color);
+        }
     }
 }
 

@@ -1,21 +1,81 @@
+use std::collections::HashMap;
+use std::hash::Hash;
+
 use sdl2::event::Event;
 use sdl2::keyboard::Scancode;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::Color as SdlColor;
+use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
-use sdl2::render::Canvas;
+use sdl2::render::{BlendMode, Canvas, Texture, TextureCreator};
+use sdl2::surface::Surface;
 use sdl2::video::Window as SdlWindow;
+use sdl2::video::WindowContext;
 use sdl2::EventPump;
 use sdl2::Sdl;
 
+use crate::text;
 use crate::tokens::{role, Color, SCR_H, SCR_W};
 use harbor_platform::Key;
 
+/// How many distinct `(text, px, color)` textures may live before the whole
+/// map is dropped (design D3): labels are stable frame to frame, so a
+/// clear-all never thrashes in practice, while dynamic strings (the HUD
+/// clock) cannot grow the cache without bound.
+const TEXT_CACHE_CAP: usize = 512;
+
 pub struct Window {
     _sdl: Sdl,
+    /// Declared before `canvas` on purpose: Rust drops fields in declaration
+    /// order, and the cached text textures must be destroyed while their
+    /// renderer (owned by `canvas`) is still alive.
+    text: TextState,
     canvas: Canvas<SdlWindow>,
     events: EventPump,
     raw: RawEventLog,
+}
+
+/// Everything `Frame::draw_text` needs: the rasterizer, its texture cache,
+/// and the creator that owns the textures.
+struct TextState {
+    creator: TextureCreator<WindowContext>,
+    renderer: Option<text::Renderer>,
+    textures: BoundedCache<TextKey, (Texture, u32, u32)>,
+}
+
+/// Cache key for one rendered label: the string, its size, and its colour.
+type TextKey = (String, u16, [u8; 4]);
+
+/// A `HashMap` with a whole-map eviction policy: once `cap` entries are in,
+/// the next insert clears the map first (design D3, "clear-all overflow").
+pub struct BoundedCache<K, V> {
+    map: HashMap<K, V>,
+    cap: usize,
+}
+
+impl<K: Eq + Hash, V> BoundedCache<K, V> {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            cap,
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        if self.map.len() >= self.cap {
+            self.map.clear();
+        }
+        self.map.insert(key, value);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 /// Logs the first [`RawEventLog::LIMIT`] raw input events to the app log so
@@ -119,6 +179,7 @@ fn install_event_filter() {
 
 pub struct Frame<'a> {
     canvas: &'a mut Canvas<SdlWindow>,
+    text: &'a mut TextState,
 }
 
 impl Window {
@@ -146,10 +207,22 @@ impl Window {
                     .map_err(|e| e.to_string())?
             }
         };
-        canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+        canvas.set_blend_mode(BlendMode::Blend);
         let events = sdl.event_pump()?;
+        let creator = canvas.texture_creator();
+        let renderer = text::Renderer::load();
+        if renderer.is_none() {
+            // Design D4: the build artifact is corrupt - keep the app alive
+            // on placeholder bars and leave the diagnosis in the log.
+            harbor_base::log("text: embedded font failed to parse; labels render as bars");
+        }
         Ok(Self {
             _sdl: sdl,
+            text: TextState {
+                creator,
+                renderer,
+                textures: BoundedCache::new(TEXT_CACHE_CAP),
+            },
             canvas,
             events,
             raw: RawEventLog::new(),
@@ -210,6 +283,7 @@ impl Window {
         self.canvas.clear();
         Frame {
             canvas: &mut self.canvas,
+            text: &mut self.text,
         }
     }
 }
@@ -221,9 +295,63 @@ impl Frame<'_> {
         let _ = self.canvas.fill_rect(Rect::new(x, y, w, h));
     }
 
+    /// Draw `text` as glyphs at `(x, y)` with the line box the placeholder
+    /// bar used (design D3). Returns `false` when no text can be drawn —
+    /// font unavailable or texture upload failed — so the caller keeps the
+    /// bar fallback (design D4). Rendered strings are cached as textures by
+    /// `(text, px, colour)`; a miss rasterizes once and reuses the texture
+    /// every frame after that.
+    pub fn draw_text(&mut self, x: i32, y: i32, text: &str, px: u16, color: Color) -> bool {
+        let key: TextKey = (text.to_string(), px, [color.r, color.g, color.b, color.a]);
+        if let Some((texture, w, h)) = self.text.textures.get(&key) {
+            let dst = Rect::new(x, y, *w, *h);
+            let _ = self.canvas.copy(texture, None, Some(dst));
+            return true;
+        }
+        let Some(renderer) = self.text.renderer.as_mut() else {
+            return false;
+        };
+        let rendered = renderer.render_to_buffer(text, px, color);
+        let (w, h) = (rendered.width as u32, rendered.height as u32);
+        let texture = match make_text_texture(&self.text.creator, &rendered) {
+            Ok(texture) => texture,
+            Err(err) => {
+                // Pathological input (e.g. a multi-thousand-pixel name):
+                // fall back to the bar rather than dropping the label.
+                harbor_base::log(&format!("text: texture upload failed: {err}"));
+                return false;
+            }
+        };
+        let dst = Rect::new(x, y, w, h);
+        let _ = self.canvas.copy(&texture, None, Some(dst));
+        self.text.textures.insert(key, (texture, w, h));
+        true
+    }
+
     pub fn present(self) {
         self.canvas.present();
     }
+}
+
+/// Upload one rendered label as an RGBA texture with blending on. The pixel
+/// buffer is borrowed by the surface only until SDL has copied it.
+fn make_text_texture(
+    creator: &TextureCreator<WindowContext>,
+    rendered: &text::RenderedText,
+) -> Result<Texture, String> {
+    let mut pixels = rendered.pixels.clone();
+    let surface = Surface::from_data(
+        &mut pixels,
+        rendered.width as u32,
+        rendered.height as u32,
+        (rendered.width * 4) as u32,
+        PixelFormatEnum::RGBA32,
+    )?;
+    let mut texture = creator
+        .create_texture_from_surface(&surface)
+        .map_err(|e| e.to_string())?;
+    texture.set_blend_mode(BlendMode::Blend);
+    Ok(texture)
 }
 
 #[cfg(test)]
@@ -307,5 +435,32 @@ mod tests {
         for t in [0x151, 0x157, 0x202, 0x207, 0x20f, 0x8001, 0xffff, 0x7f00] {
             assert!(!is_decodable_event_type(t), "0x{t:x} should be dropped");
         }
+    }
+
+    #[test]
+    fn bounded_cache_serves_hits_and_misses() {
+        let mut cache: BoundedCache<&str, u32> = BoundedCache::new(4);
+        assert!(cache.get(&"x").is_none());
+        cache.insert("x", 7);
+        assert_eq!(cache.get(&"x"), Some(&7));
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// Design D3's eviction policy: at capacity the next insert clears the
+    /// whole map first, so the cache can never exceed `cap` entries and
+    /// dynamic strings (the HUD clock) cannot grow it without bound.
+    #[test]
+    fn bounded_cache_clears_all_at_capacity() {
+        let mut cache: BoundedCache<&str, u32> = BoundedCache::new(3);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("c", 3);
+        assert_eq!(cache.len(), 3, "cap entries fit");
+        cache.insert("d", 4);
+        assert_eq!(cache.len(), 1, "overflow drops everything but the new entry");
+        assert_eq!(cache.get(&"d"), Some(&4));
+        assert!(cache.get(&"a").is_none());
+        assert!(cache.get(&"b").is_none());
+        assert!(cache.get(&"c").is_none());
     }
 }

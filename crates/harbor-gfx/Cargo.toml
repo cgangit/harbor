@@ -8,3 +8,4 @@ license.workspace = true
 harbor-base.workspace = true
 harbor-platform.workspace = true
 sdl2.workspace = true
+fontdue.workspace = true
